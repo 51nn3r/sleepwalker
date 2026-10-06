@@ -5,18 +5,18 @@
 # Re-running the same command resumes.
 #
 # One GPU, everything in one go:
-#   ./run_server.sh --preset pro --gpu 0
+#   ./run_server.sh --gpu 0                 (all 6200 training tasks; --tasks N for a smaller run, e.g. --tasks 500)
 #
 # Two GPUs (recommended for pro):
 #   1) dataset in two shards, in parallel (each process builds its own parts, no judge yet):
-#        ./run_server.sh --preset pro --shard 0/2 --gpu 0
-#        ./run_server.sh --preset pro --shard 1/2 --gpu 1
+#        ./run_server.sh --shard 0/2 --gpu 0
+#        ./run_server.sh --shard 1/2 --gpu 1
 #      wait for both (./run_server.sh --status), then
 #   2) pretraining on one GPU (judge, VM, world model, pi0, evaluations):
-#        ./run_server.sh --preset pro --stage pretrain --gpu 0
+#        ./run_server.sh --stage pretrain --gpu 0
 #   3) experiment, one arm per GPU, in parallel:
-#        ./run_server.sh --preset pro --stage experiment --arms full      --gpu 0
-#        ./run_server.sh --preset pro --stage experiment --arms grpo_text --gpu 1
+#        ./run_server.sh --stage experiment --arms full      --gpu 0
+#        ./run_server.sh --stage experiment --arms grpo_text --gpu 1
 #
 # Status (no need to stay logged in):   ./run_server.sh --status
 # Graceful stop at the next safe point: echo '{"stop": true}' > sleepwalker_runs/<run>/logs/control.json

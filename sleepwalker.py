@@ -4374,26 +4374,40 @@ def dry_check():
 # %%
 def cli_args():
     """Параметры запуска на сервере (в Colab их нет; переменные окружения не нужны):
-    python3 sleepwalker.py [--preset fast|pro] [--stage all|dataset|pretrain|experiment] [--shard i/n]
+    python3 sleepwalker.py [--tasks N] [--iterations K] [--stage all|dataset|pretrain|experiment] [--shard i/n]
                            [--arms full,grpo_text] [--gpu N] [--gpu-gb GB] [--status] [--dry]"""
     import argparse
     ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("--preset"), ap.add_argument("--stage", default="all"), ap.add_argument("--shard")
+    ap.add_argument("--tasks", type=int), ap.add_argument("--iterations", type=int)
+    ap.add_argument("--stage", default="all"), ap.add_argument("--shard")
     ap.add_argument("--arms"), ap.add_argument("--gpu"), ap.add_argument("--gpu-gb", type=float)
     ap.add_argument("--status", action="store_true"), ap.add_argument("--dry", action="store_true")
     return ap.parse_known_args()[0]
 
 
+def kk_config(tasks=0, iterations=10):
+    """Единственный набор настроек — официальный K&K (Config.pro); tasks — сколько задач обучения в датасете
+    (0 — все 6200), от него же — объём для модели мира и число частей датасета."""
+    tasks = tasks or 0
+    cfg = Config.pro(dataset_tasks=tasks, iterations=iterations)
+    if tasks:
+        att = tasks * cfg.dataset_attempts
+        cfg = replace(cfg, dataset_parts=max(1, math.ceil(att / 520)), wm_attempts=min(cfg.wm_attempts, att),
+                      bc_max_steps=min(cfg.bc_max_steps, 3 * att))
+    return cfg
+
+
 ARGS = cli_args()
-PRESET = ARGS.preset or os.environ.get("WM_PRESET", "fast")   # fast — K&K, Qwen-1.5B (sleepwalker.ipynb); pro — больше
-#                   данных и итераций (sleepwalker_pro.ipynb); на сервере: python3 sleepwalker.py --preset pro;
-#                   base — арифметика. Новые имена: прежние папки на Drive несовместимы с этой версией кода
-FULL_CFG, PRE_NAME = {"fast": (Config.fast(), "kk_fast_pre_v6"), "pro": (Config.pro(), "kk_pro_pre_v7"),
-                      "base": (Config(), "arith_pre_v4")}[PRESET]
+NB_TASKS = 1000   # для ноутбука: sleepwalker.ipynb — 1000 задач (≈6–7 ч всё), sleepwalker_pro.ipynb — 0 = все 6200
+IN_NOTEBOOK = "ipykernel" in sys.modules or "google.colab" in sys.modules
+TASKS = ARGS.tasks if ARGS.tasks is not None else (NB_TASKS if IN_NOTEBOOK else 0)   # сервер без флага — все задачи
+FULL_CFG = kk_config(TASKS, ARGS.iterations or 10)
+PRE_NAME = f"kk_{TASKS or 'all'}_pre_v7"            # новое имя версии кода: прежние папки несовместимы
 FULL_NAME = PRE_NAME.replace("_pre_", "_exp_")   # другой эксперимент с того же предобучения — другое имя здесь
-# На своём сервере (см. run_server.sh): --stage all | dataset | pretrain | experiment; --shard i/n — собирать только
-# части датасета k ≡ i (mod n) (несколько GPU параллельно); --arms full,grpo_text — какие плечи (эксперимент на двух
-# GPU: по плечу на карту); --gpu N — какая карта; --gpu-gb — память карты вручную; --status — состояние прогонов.
+# На своём сервере (см. run_server.sh): --tasks N — задач в датасете (без флага — все); --iterations K; --stage all |
+# dataset | pretrain | experiment; --shard i/n — собирать только части датасета k ≡ i (mod n) (несколько GPU
+# параллельно); --arms full,grpo_text — какие плечи (на двух GPU — по плечу на карту); --gpu N — какая карта;
+# --gpu-gb — память карты вручную; --status — состояние прогонов; --dry — проверка на заглушках.
 if ARGS.status:
     print_status()
     sys.exit(0)
@@ -4410,7 +4424,7 @@ elif STAGE_ in ("all", "pretrain", "experiment"):
     adapter_check(FULL_CFG, PRE_NAME)
 
 # %% [markdown]
-# ## 14. Предобучение (один раз; fast ≈3–4 ч, pro ≈8–12 ч — оценка)
+# ## 14. Предобучение (один раз; 1000 задач ≈3–4 ч, все 6200 ≈8–12 ч — оценка)
 # Датасет: базовая модель решает задачи обучения по полному тексту, по 2 попытки (модель мира ещё не нужна); судья
 # сравнивает пары попыток в фоне. На датасете — VM (попарно), метки RM, модель мира целиком (с RM), π0 обоих плеч и их
 # оценка. Всё на Drive; готовое не пересчитывается — после обрыва снова Run all.
@@ -4420,7 +4434,7 @@ if not DRY_RUN and not SHARD_ and STAGE_ in ("all", "pretrain", "dataset"):
     PRE = run(replace(FULL_CFG, iterations=0, arms=() if STAGE_ == "dataset" else FULL_CFG.arms), PRE_NAME)
 
 # %% [markdown]
-# ## 15. Эксперимент: обучение с подкреплением (fast ≈3–3,5 ч, pro ≈6–8 ч — оценка)
+# ## 15. Эксперимент: обучение с подкреплением (≈3–8 ч — оценка)
 # Стартует с копии предобучения. На каждой итерации актор решает каждую задачу дважды, судья сравнивает пары (в фоне),
 # VM учится на них попарно. Если сессия оборвётся — снова Run all: готовое подхватится с Drive.
 # Итог — MyDrive/sleepwalker/<имя эксперимента>/logs/results.json и logs/log.txt; всё лёгкое для анализа — в logs/

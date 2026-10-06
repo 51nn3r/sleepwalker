@@ -6,7 +6,7 @@
   строки '# !...' в ячейках кода превращаются в '!...' (команды оболочки в Colab, например pip install).
 
 Запуск: python3 build_notebook.py shapley_actor_kbhop.py   -> shapley_actor_kbhop.ipynb
-        python3 build_notebook.py sleepwalker.py --preset pro -> sleepwalker_pro.ipynb (строка PRESET = "fast" → "pro")
+        python3 build_notebook.py sleepwalker.py --preset pro -> sleepwalker_pro.ipynb (NB_TASKS = 1000 → 0, все задачи)
 """
 
 import json
@@ -44,8 +44,8 @@ def to_cell(kind, buf):
 def build(src, dst, preset=None, key=None):
     text = open(src, encoding="utf-8").read()
     if preset:
-        assert 'os.environ.get("WM_PRESET", "fast")' in text, "в исходнике нет строки PRESET"
-        text = text.replace('os.environ.get("WM_PRESET", "fast")', f'os.environ.get("WM_PRESET", "{preset}")', 1)
+        assert "NB_TASKS = 1000 " in text, "в исходнике нет строки NB_TASKS"
+        text = text.replace("NB_TASKS = 1000 ", f"NB_TASKS = {0 if preset == 'pro' else int(preset)} ", 1)
     if key:                                      # ключ OpenRouter — только в собранный ноутбук (он не в репозитории)
         assert 'OPENROUTER_API_KEY = ""' in text, "в исходнике нет строки OPENROUTER_API_KEY"
         text = text.replace('OPENROUTER_API_KEY = ""', f'OPENROUTER_API_KEY = "{key}"', 1)
