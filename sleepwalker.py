@@ -77,7 +77,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 DTYPE = torch.bfloat16 if (DEVICE == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
-print("device", DEVICE, DTYPE, "| dry_run", DRY_RUN, "| torch", torch.__version__)
+if "--status" not in sys.argv and "--stop" not in sys.argv:
+    print("device", DEVICE, DTYPE, "| dry_run", DRY_RUN, "| torch", torch.__version__)
 if not DRY_RUN and "--status" not in sys.argv and "--stop" not in sys.argv:   # работают и без пакетов моделей
     import transformers
     import peft
@@ -320,7 +321,9 @@ os.makedirs(BASE_DIR, exist_ok=True)
 LOG_PATH = None
 STATUS = {"path": None, "run": None, "stage": None, "started": None, "done": False, "stopped": False, "error": None,
           "lines": deque(maxlen=40)}
-print("Drive folder:", BASE_DIR)
+QUIET = "--status" in sys.argv or "--stop" in sys.argv   # служебные команды: без шапки с устройством и папкой
+if not QUIET:
+    print("Drive folder:", BASE_DIR)
 
 
 class StopRequested(Exception):
@@ -413,6 +416,8 @@ def print_status(dirs=None, verbose=False):
     for base in dirs or known_state_dirs():
         rows = []
         for name in sorted(os.listdir(base)):
+            if name.startswith("dry_") and not verbose:   # прогоны проверки — только с -v
+                continue
             st = load_json(os.path.join(base, name, "logs", "status.json"))
             if st:
                 rows.append((name, st))
