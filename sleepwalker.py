@@ -2501,10 +2501,22 @@ def parse_verdict(text):
     return v[-1].upper(), (int(c[-1]) if c else 3)
 
 
+def read_dotenv(name="OPENROUTER_API_KEY"):
+    """Значение из .env (строка NAME=value, кавычки допустимы) рядом со скриптом или в текущей папке; .env — не в git."""
+    for d in (os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else "", os.getcwd()):
+        p = os.path.join(d, ".env")
+        if d is not None and os.path.exists(p):
+            for line in open(p, encoding="utf-8"):
+                line = line.strip()
+                if line.startswith(name + "="):
+                    return line.split("=", 1)[1].strip().strip("'\"")
+    return ""
+
+
 def openrouter_key():
-    """Ключ OpenRouter: переменная окружения или Colab Secrets (значок ключа слева, имя OPENROUTER_API_KEY).
-    Нигде не печатается и не сохраняется."""
-    k = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    """Ключ OpenRouter: переменная окружения, затем .env (OPENROUTER_API_KEY=...), затем Colab Secrets (значок ключа
+    слева, имя OPENROUTER_API_KEY). Нигде не печатается и не сохраняется."""
+    k = os.environ.get("OPENROUTER_API_KEY", "").strip() or read_dotenv()
     if not k:
         try:
             from google.colab import userdata
@@ -2622,8 +2634,9 @@ class JudgeRunner:
         if not jobs:
             return
         if not self.cfg.dry_run and not self.key:
-            raise RuntimeError("нет ключа OpenRouter: впишите его в OPENROUTER_API_KEY в разделе 0 ноутбука (или в Colab "
-                               "Secrets под тем же именем). Без судьи: vm_pairs=\"R\" — пары только по R")
+            raise RuntimeError("нет ключа OpenRouter: положите его в .env рядом со скриптом (OPENROUTER_API_KEY=...), "
+                               "в переменную окружения, в OPENROUTER_API_KEY в разделе 0 ноутбука или в Colab Secrets. "
+                               "Без судьи: vm_pairs=\"R\" — пары только по R")
         spent, avg = self.spent(), self.avg_cost()
         for jk, msgs in jobs:
             if spent + (len(self.pending) + 1) * avg > self.cfg.judge_budget_usd:

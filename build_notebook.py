@@ -72,4 +72,9 @@ if __name__ == "__main__":
         args = [a for a in args if a not in ("--preset", preset)]
     src = args[0] if args else "shapley_actor_kbhop.py"
     import os
-    build(src, src[:-3] + (f"_{preset}" if preset else "") + ".ipynb", preset, os.environ.get("OPENROUTER_API_KEY"))
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key and os.path.exists(".env"):                  # ключ из .env (не в git) — в собранный ноутбук
+        for line in open(".env", encoding="utf-8"):
+            if line.strip().startswith("OPENROUTER_API_KEY="):
+                key = line.strip().split("=", 1)[1].strip().strip("'\"")
+    build(src, src[:-3] + (f"_{preset}" if preset else "") + ".ipynb", preset, key)

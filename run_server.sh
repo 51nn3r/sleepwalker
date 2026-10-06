@@ -3,7 +3,7 @@
 # (logs/ is the light part for analysis, weights/ the heavy part). Re-running the same command resumes.
 #
 # One GPU, everything in one go:
-#   OPENROUTER_API_KEY=... WM_PRESET=pro CUDA_VISIBLE_DEVICES=0 ./run_server.sh
+#   WM_PRESET=pro CUDA_VISIBLE_DEVICES=0 ./run_server.sh        (the key is read from .env)
 #
 # Two GPUs (recommended for pro):
 #   1) dataset in two shards, in parallel (each process builds its own parts, no judge yet):
@@ -21,8 +21,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 : "${WM_PRESET:=fast}"
+if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f .env ]; then   # the key lives in .env (git-ignored): OPENROUTER_API_KEY=...
+  set -a; . ./.env; set +a
+fi
 if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-  echo "OPENROUTER_API_KEY is not set (the judge's key): export OPENROUTER_API_KEY=..." >&2; exit 1
+  echo "OPENROUTER_API_KEY is not set: put OPENROUTER_API_KEY=... into .env next to this script (or export it)" >&2; exit 1
 fi
 if [ ! -d venv ]; then
   python3 -m venv venv

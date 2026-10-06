@@ -10,6 +10,7 @@ Files
   `OPENROUTER_API_KEY=... python3 build_notebook.py sleepwalker.py [--preset pro]` embeds the key into the notebook
   (notebooks are git-ignored for that reason).
 - `run_server.sh` — run on your own GPU server; see the header for the one-GPU and two-GPU recipes.
+- `.env` (git-ignored, copy `.env.example`) — `OPENROUTER_API_KEY=...`; read by the script, the server runner and the notebook builder.
 - `docs/` — model description and the judge design (Russian).
 
 Local self-check without GPU, models or network: `DRY_RUN=1 python3 sleepwalker.py` (stubs, ~5 min).
