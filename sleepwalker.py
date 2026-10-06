@@ -413,6 +413,7 @@ def alive(st):
 def print_status(dirs=None, verbose=False):
     """python3 sleepwalker.py --status [--state-dir ПАПКА] [-v]: одна строка на прогон — состояние, этап, когда
     обновлялся; без --state-dir — все запомненные папки состояния."""
+    shown = 0
     for base in dirs or known_state_dirs():
         rows = []
         for name in sorted(os.listdir(base)):
@@ -423,6 +424,7 @@ def print_status(dirs=None, verbose=False):
                 rows.append((name, st))
         if not rows:
             continue
+        shown += len(rows)
         print(f"{base}")
         for name, st in rows:
             if st.get("error"):
@@ -444,6 +446,10 @@ def print_status(dirs=None, verbose=False):
                 print(f"  {'':28s} ошибка: {st['error'][:160]}")
             for l in st.get("last_lines", [])[-(5 if verbose else 1):]:
                 print(f"  {'':28s} {l[:150]}")
+    if not shown:
+        print("прогонов не найдено в: " + ", ".join(dirs or known_state_dirs()) + ". Если запуск был с --state-dir, "
+              "укажите его и здесь; прогоны проверки dry_* показываются с -v; если прогон упал до записи "
+              "status.json — смотрите run_*.out рядом со скриптом")
 
 
 def request_stop(run=None, base=None):
