@@ -13,3 +13,6 @@ __pycache__/
 *.safetensors
 *.zip
 *.gz
+
+# local registry of state directories used by this checkout
+.sleepwalker_state_dirs

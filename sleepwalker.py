@@ -78,7 +78,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 DTYPE = torch.bfloat16 if (DEVICE == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
 print("device", DEVICE, DTYPE, "| dry_run", DRY_RUN, "| torch", torch.__version__)
-if not DRY_RUN and "--status" not in sys.argv:        # --status работает и без установленных пакетов моделей
+if not DRY_RUN and "--status" not in sys.argv and "--stop" not in sys.argv:   # работают и без пакетов моделей
     import transformers
     import peft
     print("transformers", transformers.__version__, "| peft", peft.__version__)
@@ -344,6 +344,7 @@ def write_status():
 def status_begin(D, name):
     STATUS.update(path=os.path.join(D.logs, "status.json"), run=name, stage="start", done=False, stopped=False,
                   error=None, started=time.strftime("%Y-%m-%d %H:%M:%S"), t0=time.time())
+    remember_state_dir(BASE_DIR)
     write_status()
 
 
@@ -373,20 +374,87 @@ def log(*args):
     write_status()
 
 
-def print_status(base=None):
-    """python3 sleepwalker.py --status: состояние всех прогонов в папке."""
-    base = base or BASE_DIR
-    for name in sorted(os.listdir(base)):
-        st = load_json(os.path.join(base, name, "logs", "status.json"))
-        if not st:
+STATE_DIRS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else ".",
+                               ".sleepwalker_state_dirs")   # какие папки состояния использовались (не в git)
+
+
+def remember_state_dir(base):
+    """Запомнить папку состояния: --status без --state-dir показывает прогоны из всех запомненных папок."""
+    try:
+        known = open(STATE_DIRS_FILE, encoding="utf-8").read().split("\n") if os.path.exists(STATE_DIRS_FILE) else []
+        if base not in known:
+            with open(STATE_DIRS_FILE, "a", encoding="utf-8") as f:
+                f.write(base + "\n")
+    except OSError:
+        pass
+
+
+def known_state_dirs():
+    out = [BASE_DIR]
+    if os.path.exists(STATE_DIRS_FILE):
+        out += [d for d in open(STATE_DIRS_FILE, encoding="utf-8").read().split("\n") if d and d not in out]
+    return [d for d in out if os.path.isdir(d)]
+
+
+def alive(st):
+    """Жив ли процесс прогона (на этой же машине): status.json без done/error, а процесса уже нет — он умер молча."""
+    if st.get("host") != socket.gethostname() or not st.get("pid"):
+        return None
+    try:
+        os.kill(int(st["pid"]), 0)
+        return True
+    except OSError:
+        return False
+
+
+def print_status(dirs=None, verbose=False):
+    """python3 sleepwalker.py --status [--state-dir ПАПКА] [-v]: одна строка на прогон — состояние, этап, когда
+    обновлялся; без --state-dir — все запомненные папки состояния."""
+    for base in dirs or known_state_dirs():
+        rows = []
+        for name in sorted(os.listdir(base)):
+            st = load_json(os.path.join(base, name, "logs", "status.json"))
+            if st:
+                rows.append((name, st))
+        if not rows:
             continue
-        state = "ОШИБКА" if st.get("error") else "остановлен" if st.get("stopped") else "готово" if st.get("done") else "идёт"
-        print(f"{name}: {state} | этап: {st.get('stage')} | обновлено {st.get('updated')} | {st.get('elapsed_min')} мин | "
-              f"{st.get('host')} {st.get('gpu')}")
-        for l in st.get("last_lines", [])[-3:]:
-            print("   ", l[:160])
-        if st.get("error"):
-            print("    ОШИБКА:", st["error"][:300])
+        print(f"{base}")
+        for name, st in rows:
+            if st.get("error"):
+                state = "ОШИБКА"
+            elif st.get("stopped"):
+                state = "остановлен"
+            elif st.get("done"):
+                state = "готово"
+            else:
+                state = "ИДЁТ" if alive(st) is not False else "УМЕР (процесса нет)"
+            try:
+                age = (time.time() - time.mktime(time.strptime(st["updated"], "%Y-%m-%d %H:%M:%S"))) / 60
+                age = f"{age:.0f} мин назад" if age < 120 else f"{age / 60:.1f} ч назад"
+            except Exception:
+                age = st.get("updated")
+            hours = f"{(st.get('elapsed_min') or 0) / 60:.1f} ч"
+            print(f"  {name:28s} {state:20s} {str(st.get('stage'))[:46]:46s} обновлено {age}, работал {hours}")
+            if st.get("error"):
+                print(f"  {'':28s} ошибка: {st['error'][:160]}")
+            for l in st.get("last_lines", [])[-(5 if verbose else 1):]:
+                print(f"  {'':28s} {l[:150]}")
+
+
+def request_stop(run=None, base=None):
+    """--stop [ПРОГОН]: записать {"stop": true} в logs/control.json — прогон остановится на ближайшей границе части
+    или итерации (состояние целое; та же команда запуска продолжит). Без имени — всем идущим прогонам папки."""
+    base = base or BASE_DIR
+    names = [run] if run else [n for n in sorted(os.listdir(base))
+                                if (load_json(os.path.join(base, n, "logs", "status.json")) or {}).get("stage")
+                                and not (load_json(os.path.join(base, n, "logs", "status.json")) or {}).get("done")]
+    for n in names:
+        d = os.path.join(base, n, "logs")
+        if not os.path.isdir(d):
+            print(f"{n}: нет такого прогона в {base}")
+            continue
+        save_json({"stop": True}, os.path.join(d, "control.json"))
+        print(f"{n}: остановка запрошена — сработает на ближайшей границе части датасета или итерации")
 
 
 def logged_errors(fn):
@@ -4378,13 +4446,15 @@ def dry_check():
 def cli_args():
     """Параметры запуска на сервере (в Colab их нет; переменные окружения не нужны):
     python3 sleepwalker.py [--tasks N] [--iterations K] [--stage all|dataset|pretrain|experiment] [--shard i/n]
-                           [--arms full,grpo_text] [--gpu N] [--gpu-gb GB] [--state-dir DIR] [--status] [--dry]"""
+                           [--arms full,grpo_text] [--gpu N] [--gpu-gb GB] [--state-dir DIR] [--status [-v]]
+                           [--stop [RUN]] [--dry]"""
     import argparse
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--tasks", type=int), ap.add_argument("--iterations", type=int)
     ap.add_argument("--stage", default="all"), ap.add_argument("--shard")
     ap.add_argument("--arms"), ap.add_argument("--gpu"), ap.add_argument("--gpu-gb", type=float), ap.add_argument("--state-dir")
     ap.add_argument("--status", action="store_true"), ap.add_argument("--dry", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true"), ap.add_argument("--stop", nargs="?", const="", default=None)
     return ap.parse_known_args()[0]
 
 
@@ -4411,9 +4481,15 @@ FULL_NAME = PRE_NAME.replace("_pre_", "_exp_")   # другой эксперим
 # dataset | pretrain | experiment; --shard i/n — собирать только части датасета k ≡ i (mod n) (несколько GPU
 # параллельно); --arms full,grpo_text — какие плечи (на двух GPU — по плечу на карту); --gpu N — какая карта;
 # --gpu-gb — память карты вручную; --state-dir ПАПКА — где хранить прогоны (по умолчанию ./sleepwalker_runs);
-# --status — состояние прогонов; --dry — проверка на заглушках.
+# --status [-v] — состояние прогонов (без --state-dir — всех запомненных папок); --stop [ПРОГОН] — остановить на
+# ближайшей границе (без имени — все идущие в папке); --dry — проверка на заглушках.
 if ARGS.status:
-    print_status()
+    if ARGS.state_dir:
+        remember_state_dir(BASE_DIR)
+    print_status([BASE_DIR] if ARGS.state_dir else None, ARGS.verbose)
+    sys.exit(0)
+if ARGS.stop is not None:
+    request_stop(ARGS.stop or None)
     sys.exit(0)
 FULL_CFG = fit_gpu(FULL_CFG, ARGS.gpu_gb)
 STAGE_ = ARGS.stage

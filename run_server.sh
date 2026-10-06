@@ -19,12 +19,13 @@
 #        ./run_server.sh --stage experiment --arms grpo_text --gpu 1
 #
 # Runs live in ./sleepwalker_runs by default; --state-dir DIR puts them elsewhere (e.g. a bigger disk): add it to every command.
-# Status (no need to stay logged in):   ./run_server.sh --status  (with the same --state-dir DIR, if used)
-# Graceful stop at the next safe point: echo '{"stop": true}' > sleepwalker_runs/<run>/logs/control.json
+# Status (no need to stay logged in):   ./run_server.sh --status            (all remembered state dirs; -v for more lines)
+#                                       ./run_server.sh --status --state-dir DIR
+# Graceful stop at the next safe point: ./run_server.sh --stop kk_300_pre_v7 --state-dir DIR   (no name: every running run there)
 # Local self-check without GPU/models/network: ./run_server.sh --dry   (runs in the foreground)
 set -euo pipefail
 cd "$(dirname "$0")"
-if [ ! -f .env ] && [[ " $* " != *" --status "* ]] && [[ " $* " != *" --dry "* ]]; then
+if [ ! -f .env ] && [[ " $* " != *" --status "* ]] && [[ " $* " != *" --stop "* ]] && [[ " $* " != *" --dry "* ]]; then
   echo "no .env: create it next to this script with a line  OPENROUTER_API_KEY=...  (the judge's key)" >&2; exit 1
 fi
 if [ ! -d venv ]; then
@@ -33,7 +34,7 @@ if [ ! -d venv ]; then
   ./venv/bin/pip install -q torch transformers peft accelerate datasets
 fi
 case " $* " in
-  *" --status "*|*" --dry "*) exec ./venv/bin/python3 sleepwalker.py "$@" ;;
+  *" --status "*|*" --stop "*|*" --dry "*) exec ./venv/bin/python3 sleepwalker.py "$@" ;;
 esac
 tag=$(echo "$*" | tr -c 'A-Za-z0-9._-' '_' | sed 's/^_*//; s/_*$//')
 nohup ./venv/bin/python3 sleepwalker.py "$@" > "run_${tag:-default}.out" 2>&1 &
