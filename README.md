@@ -13,7 +13,7 @@ Files
 - `.env` (git-ignored, copy `.env.example`) — `OPENROUTER_API_KEY=...`; read by the script, the server runner and the notebook builder.
 - `docs/` — model description and the judge design (Russian).
 
-Local self-check without GPU, models or network: `DRY_RUN=1 python3 sleepwalker.py` (stubs, ~5 min).
+Local self-check without GPU, models or network: `python3 sleepwalker.py --dry` (stubs, ~5 min).
 
 Outputs: `sleepwalker_runs/<run>/logs/` (log, config, results, trajectories, judge verdicts, metrics, `status.json`)
 and `sleepwalker_runs/<run>/weights/`. `README.txt` inside a run folder explains every file.

@@ -60,12 +60,15 @@ from collections import Counter, deque
 from dataclasses import dataclass, asdict, replace
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")   # до импорта torch
+import sys
+if "--gpu" in sys.argv:                                 # на сервере: python3 sleepwalker.py --gpu 1 — какую карту занять
+    os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[sys.argv.index("--gpu") + 1]   # (тоже до импорта torch)
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-DRY_RUN = os.environ.get("DRY_RUN") == "1"            # локальная проверка без GPU: модели-заглушки
+DRY_RUN = os.environ.get("DRY_RUN") == "1" or "--dry" in sys.argv   # локальная проверка без GPU: модели-заглушки
 OPENROUTER_API_KEY = ""   # ключ OpenRouter для судьи — прямо в ноутбуке (ваше). В исходнике и репозитории пусто: ключ
 #                           подставляется при сборке ноутбука (OPENROUTER_API_KEY=... python3 build_notebook.py …)
 if OPENROUTER_API_KEY:
@@ -75,7 +78,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 DTYPE = torch.bfloat16 if (DEVICE == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
 print("device", DEVICE, DTYPE, "| dry_run", DRY_RUN, "| torch", torch.__version__)
-if not DRY_RUN:
+if not DRY_RUN and "--status" not in sys.argv:        # --status работает и без установленных пакетов моделей
     import transformers
     import peft
     print("transformers", transformers.__version__, "| peft", peft.__version__)
@@ -4369,23 +4372,36 @@ def dry_check():
 # Если ячейка упала, полный прогон не стартует.
 
 # %%
-PRESET = os.environ.get("WM_PRESET", "fast")   # fast — K&K, Qwen-1.5B (sleepwalker.ipynb); pro — больше данных и итераций
-#                   (sleepwalker_pro.ipynb); на сервере: WM_PRESET=pro python3 sleepwalker.py;
+def cli_args():
+    """Параметры запуска на сервере (в Colab их нет; переменные окружения не нужны):
+    python3 sleepwalker.py [--preset fast|pro] [--stage all|dataset|pretrain|experiment] [--shard i/n]
+                           [--arms full,grpo_text] [--gpu N] [--gpu-gb GB] [--status] [--dry]"""
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--preset"), ap.add_argument("--stage", default="all"), ap.add_argument("--shard")
+    ap.add_argument("--arms"), ap.add_argument("--gpu"), ap.add_argument("--gpu-gb", type=float)
+    ap.add_argument("--status", action="store_true"), ap.add_argument("--dry", action="store_true")
+    return ap.parse_known_args()[0]
+
+
+ARGS = cli_args()
+PRESET = ARGS.preset or os.environ.get("WM_PRESET", "fast")   # fast — K&K, Qwen-1.5B (sleepwalker.ipynb); pro — больше
+#                   данных и итераций (sleepwalker_pro.ipynb); на сервере: python3 sleepwalker.py --preset pro;
 #                   base — арифметика. Новые имена: прежние папки на Drive несовместимы с этой версией кода
 FULL_CFG, PRE_NAME = {"fast": (Config.fast(), "kk_fast_pre_v6"), "pro": (Config.pro(), "kk_pro_pre_v7"),
                       "base": (Config(), "arith_pre_v4")}[PRESET]
 FULL_NAME = PRE_NAME.replace("_pre_", "_exp_")   # другой эксперимент с того же предобучения — другое имя здесь
-# На своём сервере (см. run_server.sh): WM_STAGE = all | dataset | pretrain | experiment; WM_SHARD = i/n — собирать
-# только части датасета k ≡ i (mod n) (несколько GPU параллельно); WM_ARMS = full,grpo_text — какие плечи
-# (эксперимент на двух GPU: по плечу на карту); WM_GPU_GB — память карты вручную; --status — состояние прогонов.
-if "--status" in sys.argv:
+# На своём сервере (см. run_server.sh): --stage all | dataset | pretrain | experiment; --shard i/n — собирать только
+# части датасета k ≡ i (mod n) (несколько GPU параллельно); --arms full,grpo_text — какие плечи (эксперимент на двух
+# GPU: по плечу на карту); --gpu N — какая карта; --gpu-gb — память карты вручную; --status — состояние прогонов.
+if ARGS.status:
     print_status()
     sys.exit(0)
-FULL_CFG = fit_gpu(FULL_CFG)
-STAGE_ = os.environ.get("WM_STAGE", "all")
-SHARD_ = tuple(int(x) for x in os.environ["WM_SHARD"].split("/")) if os.environ.get("WM_SHARD") else None
-if os.environ.get("WM_ARMS"):
-    FULL_CFG = replace(FULL_CFG, arms=tuple(os.environ["WM_ARMS"].split(",")))
+FULL_CFG = fit_gpu(FULL_CFG, ARGS.gpu_gb)
+STAGE_ = ARGS.stage
+SHARD_ = tuple(int(x) for x in ARGS.shard.split("/")) if ARGS.shard else None
+if ARGS.arms:
+    FULL_CFG = replace(FULL_CFG, arms=tuple(ARGS.arms.split(",")))
 if DRY_RUN:
     dry_check()
 elif SHARD_:
