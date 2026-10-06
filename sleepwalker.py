@@ -4400,9 +4400,9 @@ def kk_config(tasks=0, iterations=10):
 ARGS = cli_args()
 NB_TASKS = 1000   # для ноутбука: sleepwalker.ipynb — 1000 задач (≈6–7 ч всё), sleepwalker_pro.ipynb — 0 = все 6200
 IN_NOTEBOOK = "ipykernel" in sys.modules or "google.colab" in sys.modules
-TASKS = ARGS.tasks if ARGS.tasks is not None else (NB_TASKS if IN_NOTEBOOK else 0)   # сервер без флага — все задачи
-FULL_CFG = kk_config(TASKS, ARGS.iterations or 10)
-PRE_NAME = f"kk_{TASKS or 'all'}_pre_v7"            # новое имя версии кода: прежние папки несовместимы
+N_TASKS = ARGS.tasks if ARGS.tasks is not None else (NB_TASKS if IN_NOTEBOOK else 0)   # сервер без флага — все задачи
+FULL_CFG = kk_config(N_TASKS, ARGS.iterations or 10)   # (имя TASKS занято реестром задач)
+PRE_NAME = f"kk_{N_TASKS or 'all'}_pre_v7"          # новое имя версии кода: прежние папки несовместимы
 FULL_NAME = PRE_NAME.replace("_pre_", "_exp_")   # другой эксперимент с того же предобучения — другое имя здесь
 # На своём сервере (см. run_server.sh): --tasks N — задач в датасете (без флага — все); --iterations K; --stage all |
 # dataset | pretrain | experiment; --shard i/n — собирать только части датасета k ≡ i (mod n) (несколько GPU
