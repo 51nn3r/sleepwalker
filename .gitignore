@@ -1,0 +1,15 @@
+# secrets never go into the repository
+.env
+*.env
+# built notebooks carry the OpenRouter key (built from sleepwalker.py by build_notebook.py)
+sleepwalker*.ipynb
+# runs, caches, weights
+sleepwalker_runs/
+venv/
+__pycache__/
+*.pyc
+*.pt
+*.pkl
+*.safetensors
+*.zip
+*.gz
