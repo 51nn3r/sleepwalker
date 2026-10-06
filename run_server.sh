@@ -18,8 +18,8 @@
 #        ./run_server.sh --stage experiment --arms full      --gpu 0
 #        ./run_server.sh --stage experiment --arms grpo_text --gpu 1
 #
-# Runs live in ./sleepwalker_runs by default; --runs DIR puts them elsewhere (e.g. a bigger disk): add it to every command.
-# Status (no need to stay logged in):   ./run_server.sh --status  (with the same --runs DIR, if used)
+# Runs live in ./sleepwalker_runs by default; --state-dir DIR puts them elsewhere (e.g. a bigger disk): add it to every command.
+# Status (no need to stay logged in):   ./run_server.sh --status  (with the same --state-dir DIR, if used)
 # Graceful stop at the next safe point: echo '{"stop": true}' > sleepwalker_runs/<run>/logs/control.json
 # Local self-check without GPU/models/network: ./run_server.sh --dry   (runs in the foreground)
 set -euo pipefail

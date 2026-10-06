@@ -314,8 +314,8 @@ try:
     BASE_DIR = "/content/drive/MyDrive/sleepwalker"
 except ImportError:                                    # не Colab: локальная папка
     BASE_DIR = os.path.abspath("sleepwalker_runs")
-if "--runs" in sys.argv:                               # на сервере: --runs ПАПКА — где лежат прогоны (состояние, логи, веса)
-    BASE_DIR = os.path.abspath(os.path.expanduser(sys.argv[sys.argv.index("--runs") + 1]))
+if "--state-dir" in sys.argv:                               # на сервере: --state-dir ПАПКА — где лежат прогоны (состояние, логи, веса)
+    BASE_DIR = os.path.abspath(os.path.expanduser(sys.argv[sys.argv.index("--state-dir") + 1]))
 os.makedirs(BASE_DIR, exist_ok=True)
 LOG_PATH = None
 STATUS = {"path": None, "run": None, "stage": None, "started": None, "done": False, "stopped": False, "error": None,
@@ -4378,12 +4378,12 @@ def dry_check():
 def cli_args():
     """Параметры запуска на сервере (в Colab их нет; переменные окружения не нужны):
     python3 sleepwalker.py [--tasks N] [--iterations K] [--stage all|dataset|pretrain|experiment] [--shard i/n]
-                           [--arms full,grpo_text] [--gpu N] [--gpu-gb GB] [--runs DIR] [--status] [--dry]"""
+                           [--arms full,grpo_text] [--gpu N] [--gpu-gb GB] [--state-dir DIR] [--status] [--dry]"""
     import argparse
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--tasks", type=int), ap.add_argument("--iterations", type=int)
     ap.add_argument("--stage", default="all"), ap.add_argument("--shard")
-    ap.add_argument("--arms"), ap.add_argument("--gpu"), ap.add_argument("--gpu-gb", type=float), ap.add_argument("--runs")
+    ap.add_argument("--arms"), ap.add_argument("--gpu"), ap.add_argument("--gpu-gb", type=float), ap.add_argument("--state-dir")
     ap.add_argument("--status", action="store_true"), ap.add_argument("--dry", action="store_true")
     return ap.parse_known_args()[0]
 
@@ -4410,7 +4410,7 @@ FULL_NAME = PRE_NAME.replace("_pre_", "_exp_")   # другой эксперим
 # На своём сервере (см. run_server.sh): --tasks N — задач в датасете (без флага — все); --iterations K; --stage all |
 # dataset | pretrain | experiment; --shard i/n — собирать только части датасета k ≡ i (mod n) (несколько GPU
 # параллельно); --arms full,grpo_text — какие плечи (на двух GPU — по плечу на карту); --gpu N — какая карта;
-# --gpu-gb — память карты вручную; --runs ПАПКА — где хранить прогоны (по умолчанию ./sleepwalker_runs);
+# --gpu-gb — память карты вручную; --state-dir ПАПКА — где хранить прогоны (по умолчанию ./sleepwalker_runs);
 # --status — состояние прогонов; --dry — проверка на заглушках.
 if ARGS.status:
     print_status()
