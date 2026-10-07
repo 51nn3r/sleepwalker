@@ -173,6 +173,9 @@ class Config:
     gamma: float = 0.97
     lam_ret: float = 0.95
     repval_scale: float = 0.3
+    ret_scale_floor: float = 1e-3   # масштаб возвратов (P95 − P5) не ниже этого: возвраты здесь — доли P(успеха), ~0.01,
+    #                                 и порог max(1, S) из DreamerV3 оставлял актору сигнал ~0.003 (актор не учился)
+    adv_clip: float = 5.0           # |A_t| и |φ| после масштабирования — не больше
     ema_decay: float = 0.98         # на каждый шаг критика
     critic_steps: int = 32          # шагов критика за раунд воображения (цели раунда неизменны)
     critic_batch: int = 64
@@ -3221,26 +3224,27 @@ def imagine_round(actor, actor_opt, wm, critic, critic_tgt, critic_opt, codec, s
     # актор. user_phi (ваше): −Σ φ·log π + β·KL, φ — Shapley строк шага по критику; adv_plus_centered (предл.,
     # для сравнения): A_t для всех токенов + scar_lambda·(φ_i − среднее φ) для строк. Всё в масштабе возвратов.
     rs.upd_ret(tgt_b)
-    scale = max(1.0, rs.ret_scale or 1.0)
+    scale = max(cfg.ret_scale_floor, rs.ret_scale or cfg.ret_scale_floor)   # не max(1, S): см. ret_scale_floor
+    clip = lambda x: max(-cfg.adv_clip, min(cfg.adv_clip, x))
     flat = [(h, s) for h, (step, _, _) in enumerate(recs) for s in step]
     games = [(ws[h][s["b"]], s["players"], s["ans_i"], s["last"]) for h, s in flat if s["players"]]
     phis = iter(step_games(wm, critic, codec, games, cfg) if games else [])
     items, advs, phi_abs, sample = [], [], [], []
     for h, s in flat:
         phi = next(phis) if s["players"] else []
-        a = float((rets[h][s["b"]] - vc[h][s["b"]]) / scale)
+        a = clip(float((rets[h][s["b"]] - vc[h][s["b"]]) / scale))
         if len(sample) < 16:                           # образцы для анализа: окно, строки действия, их φ и A_t
             sample.append({"h": h, "window": codec.window_text(ws[h][s["b"]].tolist())[-400:],
-                           "players": s["players"], "phi": [round(x / scale, 4) for x in phi], "adv": round(a, 4),
+                           "players": s["players"], "phi": [round(clip(x / scale), 4) for x in phi], "adv": round(a, 4),
                            "answer": s["answer"], "reward": round(float(recs[h][1][s["b"]]), 4)})
         if cfg.actor_credit == "user_phi":
-            base, extra = 0.0, [x / scale for x in phi]
+            base, extra = 0.0, [clip(x / scale) for x in phi]
         else:
             mean = float(np.mean(phi)) if phi else 0.0
-            base, extra = a, [cfg.scar_lambda * (x - mean) / scale for x in phi]
+            base, extra = a, [clip(cfg.scar_lambda * (x - mean) / scale) for x in phi]
         items.append((s["prompt"], s["gen"], token_weights(actor, s["gen"], s["players"], base, extra)))
         advs.append(a)
-        phi_abs += [abs(x) / scale for x in phi]
+        phi_abs += [abs(clip(x / scale)) for x in phi]
     st = actor_steps(actor, actor_opt, items, cfg)
     st.update({"critic_loss": float(np.mean(losses_c)), "imag_steps": len(pairs),
                "imag_answer_rate": float(np.mean([s["answer"] is not None for _, s in flat])),
@@ -4464,6 +4468,7 @@ def cli_args():
     ap.add_argument("--tasks", type=int), ap.add_argument("--iterations", type=int)
     ap.add_argument("--stage", default="all"), ap.add_argument("--shard")
     ap.add_argument("--arms"), ap.add_argument("--gpu"), ap.add_argument("--gpu-gb", type=float), ap.add_argument("--state-dir")
+    ap.add_argument("--tag")
     ap.add_argument("--status", action="store_true"), ap.add_argument("--dry", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true"), ap.add_argument("--stop", nargs="?", const="", default=None)
     return ap.parse_known_args()[0]
@@ -4487,13 +4492,15 @@ IN_NOTEBOOK = "ipykernel" in sys.modules or "google.colab" in sys.modules
 N_TASKS = ARGS.tasks if ARGS.tasks is not None else (NB_TASKS if IN_NOTEBOOK else 0)   # сервер без флага — все задачи
 FULL_CFG = kk_config(N_TASKS, ARGS.iterations or 10)   # (имя TASKS занято реестром задач)
 PRE_NAME = f"kk_{N_TASKS or 'all'}_pre_v7"          # новое имя версии кода: прежние папки несовместимы
-FULL_NAME = PRE_NAME.replace("_pre_", "_exp_")   # другой эксперимент с того же предобучения — другое имя здесь
+FULL_NAME = PRE_NAME.replace("_pre_", "_exp_") + (f"_{ARGS.tag}" if ARGS.tag else "")   # --tag: ещё один эксперимент
+#                                                                                       с того же предобучения
 # На своём сервере (см. run_server.sh): --tasks N — задач в датасете (без флага — все); --iterations K; --stage all |
 # dataset | pretrain | experiment; --shard i/n — собирать только части датасета k ≡ i (mod n) (несколько GPU
 # параллельно); --arms full,grpo_text — какие плечи (на двух GPU — по плечу на карту); --gpu N — какая карта;
 # --gpu-gb — память карты вручную; --state-dir ПАПКА — где хранить прогоны (по умолчанию ./sleepwalker_runs);
 # --status [-v] — состояние прогонов (без --state-dir — всех запомненных папок); --stop [ПРОГОН] — остановить на
-# ближайшей границе (без имени — все идущие в папке); --dry — проверка на заглушках.
+# ближайшей границе (без имени — все идущие в папке); --tag ИМЯ — суффикс имени эксперимента (новый эксперимент с того
+# же предобучения); --dry — проверка на заглушках.
 if ARGS.status:
     if ARGS.state_dir:
         remember_state_dir(BASE_DIR)
