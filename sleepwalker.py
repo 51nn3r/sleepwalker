@@ -415,7 +415,8 @@ def alive(st):
 
 def print_status(dirs=None, verbose=False):
     """python3 sleepwalker.py --status [--state-dir ПАПКА] [-v]: одна строка на прогон — состояние, этап, когда
-    обновлялся; без --state-dir — все запомненные папки состояния."""
+    обновлялся; без --state-dir — все запомненные папки состояния. По умолчанию только идущие прогоны (и ошибки за
+    последние сутки); -v — все, включая готовые и прогоны проверки dry_*."""
     shown = 0
     for base in dirs or known_state_dirs():
         rows = []
@@ -423,8 +424,17 @@ def print_status(dirs=None, verbose=False):
             if name.startswith("dry_") and not verbose:   # прогоны проверки — только с -v
                 continue
             st = load_json(os.path.join(base, name, "logs", "status.json"))
-            if st:
-                rows.append((name, st))
+            if not st:
+                continue
+            if not verbose:                               # по умолчанию — только живые и свежие ошибки
+                try:
+                    age_h = (time.time() - time.mktime(time.strptime(st["updated"], "%Y-%m-%d %H:%M:%S"))) / 3600
+                except Exception:
+                    age_h = 0
+                running = not st.get("done") and not st.get("stopped") and not st.get("error") and alive(st) is not False
+                if not running and not (st.get("error") and age_h < 24):
+                    continue
+            rows.append((name, st))
         if not rows:
             continue
         shown += len(rows)
@@ -450,9 +460,9 @@ def print_status(dirs=None, verbose=False):
             for l in st.get("last_lines", [])[-(5 if verbose else 1):]:
                 print(f"  {'':28s} {l[:150]}")
     if not shown:
-        print("прогонов не найдено в: " + ", ".join(dirs or known_state_dirs()) + ". Если запуск был с --state-dir, "
-              "укажите его и здесь; прогоны проверки dry_* показываются с -v; если прогон упал до записи "
-              "status.json — смотрите run_*.out рядом со скриптом")
+        print("идущих прогонов нет в: " + ", ".join(dirs or known_state_dirs()) + ". Все прогоны (готовые, "
+              "остановленные, dry_*) — с -v; если запуск был с --state-dir, укажите его и здесь; если прогон упал до "
+              "записи status.json — смотрите run_*.out рядом со скриптом")
 
 
 def request_stop(run=None, base=None):

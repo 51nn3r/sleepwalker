@@ -19,7 +19,7 @@
 #        ./run_server.sh --stage experiment --arms grpo_text --gpu 1
 #
 # Runs live in ./sleepwalker_runs by default; --state-dir DIR puts them elsewhere (e.g. a bigger disk): add it to every command.
-# Status (no need to stay logged in):   ./run_server.sh --status            (all remembered state dirs; -v for more lines)
+# Status (no need to stay logged in):   ./run_server.sh --status            (running runs only; -v: all runs, more lines)
 #                                       ./run_server.sh --status --state-dir DIR
 # Graceful stop at the next safe point: ./run_server.sh --stop kk_300_pre_v7 --state-dir DIR   (no name: every running run there)
 # Local self-check without GPU/models/network: ./run_server.sh --dry   (runs in the foreground)
