@@ -458,7 +458,8 @@ def print_status(dirs=None, verbose=False):
             except Exception:
                 age = st.get("updated")
             hours = f"{(st.get('elapsed_min') or 0) / 60:.1f} ч"
-            print(f"  {name:28s} {state:20s} {str(st.get('stage'))[:46]:46s} обновлено {age}, работал {hours}")
+            pid = f" pid {st.get('pid')}" if state.startswith("ИДЁТ") else ""
+            print(f"  {name:28s} {state:20s} {str(st.get('stage'))[:46]:46s} обновлено {age}, работал {hours}{pid}")
             if st.get("error"):
                 print(f"  {'':28s} ошибка: {st['error'][:160]}")
             for l in st.get("last_lines", [])[-(5 if verbose else 1):]:
