@@ -3827,6 +3827,7 @@ def run_full_(cfg, D, an, seed, boot_frames, bc_frames, pairs, vocab, eval_tasks
     save_metrics = lambda: save_json(metrics, os.path.join(dl, "metrics.json"))
     train_p, held_p = split_pairs(pairs)
     if not st.get("bc"):                               # стартовая цепочка: VM → метки RM → модель мира с RM → π0
+        metrics.pop("eval_pi0", None)                  # цепочка идёт заново (state.json удалён) — старая оценка π0 устарела
         stage(f"{an}: предобучение VM")
         pre = os.path.join(dw, "pretraining")          # этапы цепочки сохраняются по ходу: обрыв не отбрасывает часы
         shapley_p = os.path.join(dt, "dataset_with_shapley.json.gz")
