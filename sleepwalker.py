@@ -468,6 +468,27 @@ def print_status(dirs=None, verbose=False):
         print("идущих прогонов нет в: " + ", ".join(dirs or known_state_dirs()) + ". Все прогоны (готовые, "
               "остановленные, dry_*) — с -v; если запуск был с --state-dir, укажите его и здесь; если прогон упал до "
               "записи status.json — смотрите run_*.out рядом со скриптом")
+    procs = live_processes()
+    if procs:
+        print("процессы sleepwalker на этой машине (status.json появляется после быстрой проверки, через 3–5 мин):")
+        for pid, args in procs:
+            print(f"  pid {pid}: {args}")
+
+
+def live_processes():
+    """Запущенные процессы sleepwalker.py на этой машине (кроме самого --status/--stop): по /proc."""
+    out = []
+    for d in os.listdir("/proc") if os.path.isdir("/proc") else []:
+        if not d.isdigit() or int(d) == os.getpid():
+            continue
+        try:
+            args = open(f"/proc/{d}/cmdline", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        args = [a.decode("utf-8", "replace") for a in args if a]
+        if any(a.endswith("sleepwalker.py") for a in args) and "--status" not in args and "--stop" not in args:
+            out.append((int(d), " ".join(args[args.index(next(a for a in args if a.endswith("sleepwalker.py"))) + 1:]) or "(без параметров)"))
+    return out
 
 
 def request_stop(run=None, base=None):
