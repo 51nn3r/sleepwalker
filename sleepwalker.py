@@ -167,12 +167,14 @@ class Config:
     head_layers: int = 2
     rm_loss_scale: float = 1.0      # вес потери RM внутри модели мира (метки приведены к единичному разбросу)
     critic_lr: float = 3e-4
-    horizon: int = 3
+    horizon: int = 5                # горизонт воображения; = max_steps, чтобы в воображении был виден конец ходов: при
+    #                                 коротком горизонте «продолжать» всегда выигрывало у «ответить» (бутстрап критика
+    #                                 против терминального ответа), и актор переставал отвечать (прогон fix_00_lr)
     imag_batch: int = 96
     imag_rounds: int = 4
     gamma: float = 0.97
     lam_ret: float = 0.95
-    repval_scale: float = 0.3
+    repval_scale: float = 1.0       # вес настоящих возвратов у критика (против оптимизма бутстрапа)
     ret_scale_floor: float = 1e-3   # масштаб возвратов (P95 − P5) не ниже этого: возвраты здесь — доли P(успеха), ~0.01,
     #                                 и порог max(1, S) из DreamerV3 оставлял актору сигнал ~0.003 (актор не учился)
     adv_clip: float = 5.0           # |A_t| и |φ| после масштабирования — не больше
@@ -3885,6 +3887,10 @@ def run_full_(cfg, D, an, seed, boot_frames, bc_frames, pairs, vocab, eval_tasks
         samples = [r.pop("sample", []) for r in rounds]
         save_json_gz(samples, os.path.join(dt, f"imagination_{it + 1:02d}.json.gz"))   # образцы воображения
         m["imag"] = {k: float(np.mean([r[k] for r in rounds if k in r])) for k in (rounds[0] if rounds else {})}
+        if m["imag"].get("imag_answer_rate", 1.0) < 0.1 and m["rollout"].get("answered", 1.0) > 0.5:
+            log(f"!!! ВНИМАНИЕ [{an}]: в воображении актор почти не отвечает (доля ответов "
+                f"{m['imag']['imag_answer_rate']:.2f}) — заслуга ответа отрицательна против «продолжать»; если так "
+                f"несколько итераций подряд, успех на отложенных задачах упадёт")
         m["minutes"] = (time.time() - t0) / 60
         log(f"[{an}] итерация {it + 1}/{cfg.iterations}: успех попыток {m['rollout']['acc']:.3f} | "
             f"пары новых попыток {m['vm_online_pairs']} | VM {m['vm']} | WM с RM {m['wm']} | "
