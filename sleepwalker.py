@@ -281,7 +281,7 @@ class Config:
         сравнивает пары в фоне (≈$1). Модель мира учится на 4000 попытках из него (предл.). GSM8K:
         Config.pro(task="gsm8k")."""
         base = dict(task="kk", kk_source="hf", actor_model="Qwen/Qwen2.5-1.5B-Instruct",
-                    max_steps=5, max_answer_chars=300,
+                    max_steps=8, max_answer_chars=300,   # 8 ходов: 5 было мало
                     kk_people=(2, 8), kk_eval_people=(2, 8), dataset_tasks=0, dataset_attempts=2, dataset_parts=24,
                     wm_attempts=4000, bc_max_steps=6000,
                     n_iter_tasks=64, n_eval=350, iterations=10, eval_every=5, max_state_tokens=512,
@@ -1199,7 +1199,9 @@ ACTOR_REST = (", or a line 'ANSWER: <final answer>'. Requests of one turn run in
               "results. Every request automatically gets the path: the task and the steps done so far on every level; "
               "anything else it needs must be written into the request. The requests of turn n appear in the state as S<n> "
               "and their results, in the same order, as R<n>. "
-              "T shows used/available turns: answer before they run out. If the state starts with PATH, those lines "
+              "T is your budget of turns: used/total. When the turns run out without an ANSWER line the task fails "
+              "exactly as with a wrong answer, so plan the requests to leave a turn for the ANSWER. If the state starts "
+              "with PATH, those lines "
               "are read-only context from the levels above: answer only the question marked "
               "'Q (answer only this question)'.")
 SYSTEM_ACTOR = ACTOR_INTRO + ACTOR_REQS_SUB + ACTOR_REST
@@ -2547,7 +2549,7 @@ def vm_diagnostics(vm, frames):
 JUDGE_SYSTEM = """You are a careful judge of solutions to "Knights and Knaves" logic puzzles. Knights always tell the truth; knaves always lie. You will compare two attempts, A and B, that a small language model (the "solver") made on the same puzzle, and decide which attempt is better.
 
 How to read an attempt
-- The solver works in numbered steps "S1:", "S2:", ... (at most 5).
+- The solver works in numbered steps "S1:", "S2:", ... (a small fixed budget of turns).
 - In a step it sends requests; their results come back on the next line "R<k>:", in the same order, separated by " ; ":
   - "LLM <question>": a one-shot question to a helper model. The reply is short and may be wrong.
   - "SUB <question>": a sub-task solved by another copy of the solver; only its final result is shown, and it may be wrong.
@@ -3528,7 +3530,7 @@ def success_frames(data, max_steps, seed=1):
 def dataset_settings(cfg, n_attempts, n_parts):
     return json.loads(json.dumps({"attempts_total": n_attempts, "parts": n_parts, "cfg": {   # кортеж → список
         k: getattr(cfg, k) for k in ("task", "kk_source", "kk_people", "kk_depth", "dataset_tasks", "dataset_attempts",
-                                     "dataset_parts", "dataset_temperature", "max_steps", "max_level", "max_reqs",
+                                     "dataset_parts", "dataset_temperature", "max_level", "max_reqs",
                                      "max_answer_chars", "gen_action_tokens", "actor_model", "sub_top", "sub_min",
                                      "sub_total")}}))
 
@@ -4495,6 +4497,7 @@ def kk_config(tasks=0, iterations=10):
     (0 — все 6200), от него же — объём для модели мира и число частей датасета."""
     tasks = tasks or 0
     cfg = Config.pro(dataset_tasks=tasks, iterations=iterations)
+    cfg = replace(cfg, horizon=cfg.max_steps)       # воображение — до конца ходов
     if tasks:
         att = tasks * cfg.dataset_attempts
         cfg = replace(cfg, dataset_parts=max(1, math.ceil(att / 520)), wm_attempts=min(cfg.wm_attempts, att),
@@ -4507,7 +4510,7 @@ NB_TASKS = 1000   # для ноутбука: sleepwalker.ipynb — 1000 зада
 IN_NOTEBOOK = "ipykernel" in sys.modules or "google.colab" in sys.modules
 N_TASKS = ARGS.tasks if ARGS.tasks is not None else (NB_TASKS if IN_NOTEBOOK else 0)   # сервер без флага — все задачи
 FULL_CFG = kk_config(N_TASKS, ARGS.iterations or 10)   # (имя TASKS занято реестром задач)
-PRE_NAME = f"kk_{N_TASKS or 'all'}_pre_v7"          # новое имя версии кода: прежние папки несовместимы
+PRE_NAME = f"kk_{N_TASKS or 'all'}_pre_v8"          # v8: подсказка про бюджет, 8 ходов — датасет и предобучение заново
 FULL_NAME = PRE_NAME.replace("_pre_", "_exp_") + (f"_{ARGS.tag}" if ARGS.tag else "")   # --tag: ещё один эксперимент
 #                                                                                       с того же предобучения
 # На своём сервере (см. run_server.sh): --tasks N — задач в датасете (без флага — все); --iterations K; --stage all |
