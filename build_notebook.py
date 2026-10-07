@@ -70,7 +70,7 @@ if __name__ == "__main__":
     if "--preset" in args:
         preset = args[args.index("--preset") + 1]
         args = [a for a in args if a not in ("--preset", preset)]
-    src = args[0] if args else "shapley_actor_kbhop.py"
+    src = args[0] if args else "sleepwalker.py"
     import os
     key = os.environ.get("OPENROUTER_API_KEY")
     if not key and os.path.exists(".env"):                  # ключ из .env (не в git) — в собранный ноутбук
