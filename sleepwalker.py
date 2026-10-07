@@ -178,6 +178,8 @@ class Config:
     ret_scale_floor: float = 1e-3   # масштаб возвратов (P95 − P5) не ниже этого: возвраты здесь — доли P(успеха), ~0.01,
     #                                 и порог max(1, S) из DreamerV3 оставлял актору сигнал ~0.003 (актор не учился)
     adv_clip: float = 5.0           # |A_t| и |φ| после масштабирования — не больше
+    bad_action_penalty: float = 1.0 # штраф за неправильное действие (ваше), в тех же единицах, что φ после масштаба:
+    #                                 идёт в заслугу актора на все токены действия (см. bad_action)
     ema_decay: float = 0.98         # на каждый шаг критика
     critic_steps: int = 32          # шагов критика за раунд воображения (цели раунда неизменны)
     critic_batch: int = 64
@@ -3050,6 +3052,28 @@ def lambda_returns(rewards, conts, values, gamma, lam):
     return ret
 
 
+def bad_action(text, reqs, ans, last, allow_sub, cfg):
+    """Штраф за неправильное действие (ваше; идёт в заслугу актора вместе с φ). 1 — пустой ход (ни запроса, ни ответа)
+    и ходы кончились без ответа; 0.5 — SUB без права на него, дописанный «= результат», строки вне формата, запросов
+    больше max_reqs. Итог не больше 2. → (штраф, причины)."""
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    why = []
+    if ans is None and not reqs:
+        why.append("empty")
+    if last and ans is None:
+        why.append("no_answer_at_last_turn")
+    if not allow_sub and any(re.match(r"^\s*(S\d+\s*:\s*)?SUB\b", l, re.I) for l in lines):
+        why.append("sub_not_allowed")
+    if any(re.match(r"^\s*(S\d+\s*:\s*)?(SUB|LLM)\b", l, re.I) and " = " in l for l in lines):
+        why.append("result_written")
+    if any(not re.match(r"^\s*(S\d+\s*:\s*)?(PLAN|SUB|LLM|ANSWER|R\d+)\b", l, re.I) for l in lines):
+        why.append("junk_lines")
+    if sum(bool(re.match(r"^\s*(S\d+\s*:\s*)?(SUB|LLM)\b", l, re.I)) for l in lines) > cfg.max_reqs:
+        why.append("too_many_requests")
+    p = sum(1.0 if w in ("empty", "no_answer_at_last_turn") else 0.5 for w in why)
+    return min(p, 2.0), why
+
+
 def token_weights(actor, gen, lines, base, extra):
     """Вес каждого токена действия: base для всех + extra[i] для токенов строки-игрока i."""
     w = [base] * len(gen)
@@ -3177,8 +3201,9 @@ def imagine_round(actor, actor_opt, wm, critic, critic_tgt, critic_opt, codec, s
                     rq["dest"] = "LLM"
             subs[b] = max(0, subs[b] - sum(rq["dest"] == "SUB" for rq in reqs))
             last = used[b] + h + 1 >= cfg.max_steps            # ходы уровня кончились: эпизод обрывается
+            bad, why = bad_action(acts[k][1], reqs, ans, last, subs[b] + sum(rq["dest"] == "SUB" for rq in reqs) > 0, cfg)
             step.append({"b": b, "prompt": prompts[k], "gen": acts[k][0], "players": players, "answer": ans,
-                         "ans_i": len(players) - 1 if ans is not None else None, "last": last})
+                         "ans_i": len(players) - 1 if ans is not None else None, "last": last, "bad": bad, "why": why})
             c[b] = 0.0 if (ans is not None or last) else 1.0
             if c[b] == 0:
                 alive[b] = False
@@ -3247,15 +3272,17 @@ def imagine_round(actor, actor_opt, wm, critic, critic_tgt, critic_opt, codec, s
     for h, s in flat:
         phi = next(phis) if s["players"] else []
         a = clip(float((rets[h][s["b"]] - vc[h][s["b"]]) / scale))
+        pen = cfg.bad_action_penalty * s.get("bad", 0.0)   # штраф за неправильное действие — на все токены действия
         if len(sample) < 16:                           # образцы для анализа: окно, строки действия, их φ и A_t
             sample.append({"h": h, "window": codec.window_text(ws[h][s["b"]].tolist())[-400:],
                            "players": s["players"], "phi": [round(clip(x / scale), 4) for x in phi], "adv": round(a, 4),
-                           "answer": s["answer"], "reward": round(float(recs[h][1][s["b"]]), 4)})
+                           "answer": s["answer"], "reward": round(float(recs[h][1][s["b"]]), 4),
+                           "penalty": pen, "why": s.get("why", [])})
         if cfg.actor_credit == "user_phi":
-            base, extra = 0.0, [clip(x / scale) for x in phi]
+            base, extra = -pen, [clip(x / scale) for x in phi]
         else:
             mean = float(np.mean(phi)) if phi else 0.0
-            base, extra = a, [clip(cfg.scar_lambda * (x - mean) / scale) for x in phi]
+            base, extra = a - pen, [clip(cfg.scar_lambda * (x - mean) / scale) for x in phi]
         items.append((s["prompt"], s["gen"], token_weights(actor, s["gen"], s["players"], base, extra)))
         advs.append(a)
         phi_abs += [abs(clip(x / scale)) for x in phi]
@@ -3264,6 +3291,8 @@ def imagine_round(actor, actor_opt, wm, critic, critic_tgt, critic_opt, codec, s
                "imag_answer_rate": float(np.mean([s["answer"] is not None for _, s in flat])),
                "adv_abs": float(np.mean(np.abs(advs))), "phi_abs": float(np.mean(phi_abs)) if phi_abs else 0.0,
                "multi_player_steps": sum(len(s["players"]) >= 2 for _, s in flat),
+               "bad_action_rate": float(np.mean([s.get("bad", 0.0) > 0 for _, s in flat])),
+               "bad_action_mean": float(np.mean([s.get("bad", 0.0) for _, s in flat])),
                "imag_reward": float(torch.stack([x[1] for x in recs]).mean()), "sample": sample})
     return st
 
@@ -4337,6 +4366,10 @@ def dry_check():
     assert " = " not in nf["steps"][0]["next_state"] and "\nR1: " in nf["steps"][0]["next_state"], nf["steps"][0]["next_state"]
     assert shot_state("S1: LLM 3 + 4 = 7 ; LLM 10 - 2 = 8\nS2: ANSWER x = y") == "S1: LLM 3 + 4 ; LLM 10 - 2\nR1: 7 ; 8\nS2: ANSWER x = y"
     assert clean_action("PLAN: p\nSUB: q? = fake ; SUB q2\nANSWER: a = b") == "PLAN: p\nSUB: q?\nANSWER: a = b"
+    assert bad_action("PLAN: only a plan", [], None, False, True, CFG) == (1.0, ["empty"])
+    assert bad_action("SUB: q?", [{"dest": "SUB"}], None, True, True, CFG)[1] == ["no_answer_at_last_turn"]
+    assert bad_action("PLAN: p\nSUB: q? = fake\nblah", [{"dest": "SUB"}], None, False, False, CFG) == (1.5, ["sub_not_allowed", "result_written", "junk_lines"])
+    assert bad_action("PLAN: p\nANSWER: x", [], "x", True, True, CFG) == (0.0, [])
     assert strip_echo("Is X a knight?", "Is X a knight? = yes") == "yes" and strip_echo("Is X a knight?", "yes") == "yes"
     assert strip_echo("Is X a knight?", "is x a knight?") == "?"
     pa = parse_action("PLAN: next case\nS2: SUB Assume A is a knave. Who is who? ; LLM Is B a knight?\nR2: A is a knave", 0, CFG)
