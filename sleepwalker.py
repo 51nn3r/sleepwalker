@@ -4088,8 +4088,8 @@ def adapter_check(cfg, name):
     D = RunDirs(os.path.join(BASE_DIR, name))
     os.makedirs(D.logs, exist_ok=True)
     LOG_PATH = os.path.join(D.logs, "log.txt")
-    status_begin(D, name)
-    stage("быстрая проверка")
+    STATUS["path"] = None                            # status.json папки — только у настоящего прогона, не у проверки
+    log("=== быстрая проверка")
     mark = os.path.join(D.logs, "adapter_check.json")
     if (load_json(mark) or {}).get("version") == 7:  # версия проверки: новая проверка не пропускается
         log("проверка адаптеров для этого прогона уже пройдена:", load_json(mark))
