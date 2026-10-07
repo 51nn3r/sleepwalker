@@ -1214,19 +1214,32 @@ def sub_allow(cfg, level):
     return max(cfg.sub_min, cfg.sub_top >> level) if level < cfg.max_level else 0
 
 
-def actor_system(cfg, allow_sub=True):
-    """Подсказка актора. Счётчик подзадач кончился — SUB в ней даже не предлагается (ваше)."""
+ACTOR_LAST_TURN = ("This is your last turn: no request can be executed any more. Write 'PLAN: <one line>' and then "
+                   "'ANSWER: <final answer>' using the results gathered so far (at sub-levels, the answer to the "
+                   "question marked 'Q (answer only this question)'). ")
+
+
+def actor_system(cfg, allow_sub=True, last_turn=False):
+    """Подсказка актора. Счётчик подзадач кончился — SUB в ней даже не предлагается (ваше). Последний ход бюджета —
+    запросы не предлагаются вовсе, только ответ (ваше: как и с SUB, модель следует тому, что ей предложено)."""
+    if last_turn:
+        return ACTOR_LAST_TURN + TASK.hint_nosub
     reqs = ACTOR_REQS_SUB if allow_sub else ACTOR_REQS_LLM
     return (ACTOR_INTRO.format(k=cfg.max_reqs) + reqs + ACTOR_REST + " " +
             (TASK.hint if allow_sub else TASK.hint_nosub))
 
 
-def task_shots(cfg, allow_sub=True):
-    """Примеры с настоящими L, T и остатком SUB; без SUB — только примеры, где SUB нет."""
+def task_shots(cfg, allow_sub=True, last_turn=False):
+    """Примеры с настоящими L, T и остатком SUB; без SUB — только примеры, где SUB нет; на последнем ходе — только
+    примеры с ответом, и ход в них — последний."""
     out = []
     for u, a in TASK.shots:
-        if not allow_sub and "SUB:" in a:
+        if (not allow_sub or last_turn) and "SUB:" in a:
             continue
+        if last_turn and ("LLM:" in a or "ANSWER:" not in a):
+            continue
+        if last_turn:
+            u = re.sub(r"T: \d+/\{T\}", f"T: {cfg.max_steps - 1}/{{T}}", u)
         lvl = int(re.search(r"L: (\d+)/\{L\}", u).group(1))
         used = sum(x.count("SUB ") for x in u.split("\n") if re.match(r"S\d+:", x))
         left = max(0, sub_allow(cfg, lvl) - used) if allow_sub else 0
@@ -1236,10 +1249,10 @@ def task_shots(cfg, allow_sub=True):
     return out
 
 
-def actor_prompt(actor, cfg, content, few_shot=False, allow_sub=True):
+def actor_prompt(actor, cfg, content, few_shot=False, allow_sub=True, last_turn=False):
     """Подсказка актора: система + (примеры репликами чата — только для стартовой политики) + состояние или окно."""
-    return actor.prompt_ids(actor_system(cfg, allow_sub), "STATE:\n" + content,
-                            task_shots(cfg, allow_sub) if few_shot else None)
+    return actor.prompt_ids(actor_system(cfg, allow_sub, last_turn), "STATE:\n" + content,
+                            task_shots(cfg, allow_sub, last_turn) if few_shot else None)
 
 
 # модель не должна дописывать следующее состояние: в стартовых данных pro_v2 так продолжались ~4,5 % действий
@@ -2185,18 +2198,21 @@ def run_episodes(tasks, actor, cfg, mode, wm=None, codec=None, greedy=False, few
         states = [render_state(f["request"], f["level"], f["plan"], f["steps"], cfg, f["path"], f["subs_left"])
                   for f in ready]
         allow = [f["subs_left"] > 0 and size[root_of[f["id"]]] < cfg.sub_total for f in ready]
+        lasts = [len(f["steps"]) >= cfg.max_steps - 1 for f in ready]     # последний ход бюджета: только ответ
         if mode == "window":
             wins = encode_texts(wm, codec, states, cfg)
             contents = [codec.window_text(w.tolist()) for w in wins]
         else:
             contents = states
-        prompts = [actor_prompt(actor, cfg, c, few_shot, a) for c, a in zip(contents, allow)]
+        prompts = [actor_prompt(actor, cfg, c, few_shot, a, lt) for c, a, lt in zip(contents, allow, lasts)]
         acts = actor.generate(prompts, cfg.gen_action_tokens, greedy, cfg.temperature, which=which)
         jobs = []
-        for f, s_text, c, p, (gids, text), al in zip(ready, states, contents, prompts, acts, allow):
+        for f, s_text, c, p, (gids, text), al, lt in zip(ready, states, contents, prompts, acts, allow, lasts):
             plan, reqs, ans, _ = parse_action(text, f["level"], cfg)
+            if lt and ans is None:
+                reqs = []                                  # на последнем ходе запросы не исполняются: ответа нет — конец
             f["steps"].append({"state": s_text, "prompt": p, "gen": gids, "action": text, "plan": plan, "reqs": reqs,
-                               "answer": ans, "subs_before": f["subs_left"], "allow_sub": al,
+                               "answer": ans, "subs_before": f["subs_left"], "allow_sub": al, "last_turn": lt,
                                **({"window": c} if mode == "window" else {})})   # что видел актор (для анализа)
             if plan:
                 f["plan"] = plan
@@ -3184,7 +3200,8 @@ def imagine_round(actor, actor_opt, wm, critic, critic_tgt, critic_opt, codec, s
         if not idx:
             break
         cur = ws[-1]
-        prompts = [actor_prompt(actor, cfg, codec.window_text(cur[b].tolist()), allow_sub=subs[b] > 0) for b in idx]
+        prompts = [actor_prompt(actor, cfg, codec.window_text(cur[b].tolist()), allow_sub=subs[b] > 0,
+                                last_turn=used[b] + h + 1 >= cfg.max_steps) for b in idx]
         acts = actor.generate(prompts, cfg.gen_action_tokens, greedy=False, temperature=cfg.temperature)
         a_ids, a_pad = pad_batch([codec.ids(t, cfg.max_action_tokens) for _, t in acts])
         nxt = cur.clone()
@@ -3196,6 +3213,8 @@ def imagine_round(actor, actor_opt, wm, critic, critic_tgt, critic_opt, codec, s
         step = []
         for k, b in enumerate(idx):
             plan, reqs, ans, players = parse_action(acts[k][1], levels[b], cfg)
+            if used[b] + h + 1 >= cfg.max_steps and ans is None:
+                reqs = []                                  # последний ход: запросы не исполняются
             if subs[b] <= 0:                               # счётчик кончился: SUB — обычным запросом
                 for rq in reqs:
                     rq["dest"] = "LLM"
@@ -3314,7 +3333,7 @@ def bc_items(actor, frames, cfg, mode, wm=None, codec=None):
     def gen(st):                                       # действие с дописанным «= результат» — переразобрать начисто
         clean = clean_action(st["action"])
         return st["gen"] if clean == st["action"] else actor.encode_action(clean)
-    return [(actor_prompt(actor, cfg, c, allow_sub=st.get("allow_sub", True)), gen(st))
+    return [(actor_prompt(actor, cfg, c, allow_sub=st.get("allow_sub", True), last_turn=st.get("last_turn", False)), gen(st))
             for c, st in zip(contents, steps)]
 
 
