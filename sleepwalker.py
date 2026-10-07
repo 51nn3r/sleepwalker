@@ -199,6 +199,11 @@ class Config:
     # VM попарно (ваше) и судья пар (предл.). Ключ OpenRouter — не здесь: Config целиком пишется в log.txt
     vm_pairs: str = "judge"         # judge — пары по R и по судье; R — только по R (без учителя); none — поточечно
     vm_point_weight: float = 0.3    # вес поточечной части рядом с попарной (шкала и входы подзадач)
+    vm_coalitions: int = 3          # поточечно VM учится и на неполных коалициях шагов кадра (предл.): пустая + столько−1
+                                    # случайных подмножеств, метка — исход кадра. Игра Shapley спрашивает VM именно о них;
+                                    # без этого v(без шагов) — экстраполяция (kk_1000_pre_v8: v(пусто) ≈ 0.19 при доле
+                                    # удач 0.04, сумма Shapley кадра −0.15, gain-AUC 0.33 — ниже наугад)
+    vm_coalition_weight: float = 1.0  # вес текста коалиции рядом с полной траекторией кадра
     vm_pair_epochs: int = 2         # проходов по парам на предобучении
     vm_iter_pairs: int = 800        # пар из датасета на итерации (повторяются вместе с парами новых эпизодов)
     online_pair_iters: int = 5      # пары скольких последних итераций VM повторяет (как буфер)
@@ -2344,11 +2349,11 @@ def shapley(m, v):
     return phi
 
 
-def vm_examples(frames, cfg, levels=False):
-    """Примеры VM: наверху метка — R. У подзадачи (предл.) — исход задачи наверху (1 — решена, 0 — нет), без ответа
-    — 0; вес sub_weight. Раньше подзадачи с ответом при нерешённой задаче в обучение не шли, и у подзадач метка
-    совпадала с «был ли ответ» (VM учила «ответила — значит полезно», а не «решено»). levels=True — ещё флаг
-    «верхний уровень» (для диагностики)."""
+def vm_examples(frames, cfg):
+    """Примеры VM: (текст, метка, вес, верхний уровень, кадр). Наверху метка — R. У подзадачи (предл.) — исход задачи
+    наверху (1 — решена, 0 — нет), без ответа — 0; вес sub_weight. Раньше подзадачи с ответом при нерешённой задаче
+    в обучение не шли, и у подзадач метка совпадала с «был ли ответ» (VM учила «ответила — значит полезно», а не
+    «решено»). Кадр нужен поточечному обучению: из него строятся тексты коалиций (vm_coalition_examples)."""
     ex = []
     for f in frames:
         if not f["steps"]:
@@ -2356,26 +2361,56 @@ def vm_examples(frames, cfg, levels=False):
         top = f["level"] == 0
         r = f.get("R", 0.0) if top else (f.get("root_R", 0.0) if f["answer"] is not None else 0.0)
         y, w = (1.0 if r > 0.5 else 0.0), (1.0 if top else cfg.sub_weight)
-        ex.append((vm_text(f), y, w, top) if levels else (vm_text(f), y, w))
+        ex.append((vm_text(f), y, w, top, f))
     return ex
+
+
+def vm_coalition_examples(f, y, w, cfg):
+    """Тексты неполных коалиций кадра для поточечного обучения VM (предл.): пустая (только запрос и путь) и до
+    vm_coalitions − 1 случайных неполных подмножеств шагов — все с меткой кадра и весом w·vm_coalition_weight.
+    Игра Shapley спрашивает VM ровно о таких текстах; пока VM видела в обучении только полные траектории, v(пусто) и
+    v(часть шагов) были экстраполяцией: в kk_1000_pre_v8 v(пусто) наверху вышла ≈0.19 при доле удач 0.04, сумма
+    Shapley кадра — −0.15 (ANSWER −0.18), gain-AUC — 0.33 (в pro_v7 те же тексты случайно легли иначе: 0.69)."""
+    m, n = len(f["steps"]), max(0, cfg.vm_coalitions)
+    if m == 0 or n == 0:
+        return []
+    subsets = [set()]
+    if m <= 10:
+        pool = [S for r in range(1, m) for S in itertools.combinations(range(m), r)]
+        subsets += [set(S) for S in random.sample(pool, min(n - 1, len(pool)))]
+    else:                                               # подмножеств слишком много, чтобы перечислять
+        seen = {(), tuple(range(m))}
+        for _ in range(8 * n):
+            S = tuple(i for i in range(m) if random.random() < 0.5)
+            if S not in seen:
+                seen.add(S)
+                subsets.append(set(S))
+            if len(subsets) >= n:
+                break
+    return [(vm_text(f, S), y, w * cfg.vm_coalition_weight) for S in subsets]
 
 
 def vm_point_data(examples, cfg, budget=None):
     """Поточечные примеры VM (предл.): удач ~2 %, поэтому их вес w = N/P (P, N — суммарный вес удач и неудач), но не
     больше vm_pos_weight_max. budget — сколько примеров взять: все удачи + случайные неудачи с весом 1/q (q — доля
     взятых), чтобы выборка не меняла баланс. Сырой логит тогда смещён на log w; vm_probs вычитает сдвиг — снаружи
-    VM даёт P успеха (сдвиги потом подбираются по уровням: fit_vm_offsets). → (данные, w, средний вес, число удач)."""
-    pos = [(t, y, w) for t, y, w in examples if y > 0.5]
-    neg = [(t, y, w) for t, y, w in examples if y <= 0.5]
+    VM даёт P успеха (сдвиги потом подбираются по уровням: fit_vm_offsets). → (группы, w, средний вес, число удач).
+    Группа — полный текст кадра и тексты его неполных коалиций (vm_coalition_examples; у примера без кадра — только
+    полный текст); пачки обучения набираются группами, чтобы число коалиций не меняло, сколько раз VM видит кадр
+    (и сколько раз повторяются пары)."""
+    pos = [e for e in examples if e[1] > 0.5]
+    neg = [e for e in examples if e[1] <= 0.5]
     if not pos and not neg:
         return [], 1.0, 0.0, 0
-    P, N = sum(w for _, _, w in pos), sum(w for _, _, w in neg)
+    P, N = sum(e[2] for e in pos), sum(e[2] for e in neg)
     cap = cfg.vm_pos_weight_max
     wpos = min(cap, max(1.0 / cap, N / P)) if P > 0 and N > 0 else 1.0
     k = len(neg) if budget is None else min(len(neg), max(budget - len(pos), budget // 2))
     q = k / len(neg) if neg else 1.0
-    data = [(t, y, w * wpos) for t, y, w in pos] + [(t, y, w / q) for t, y, w in random.sample(neg, k)]
-    wbar = sum(e[2] for e in data) / max(1, len(data))   # постоянный делитель: делить на сумму весов своей пачки
+    group = lambda e, w: [(e[0], e[1], w)] + (vm_coalition_examples(e[4], e[1], w, cfg) if len(e) > 4 else [])
+    data = [group(e, e[2] * wpos) for e in pos] + [group(e, e[2] / q) for e in random.sample(neg, k)]
+    flat = [x for g in data for x in g]
+    wbar = sum(x[2] for x in flat) / max(1, len(flat))   # постоянный делитель: делить на сумму весов своей пачки
     return data, wpos, wbar, len(pos)                     # нельзя — удача раздувает её сама, и вес удач выходит не w
 
 
@@ -2392,6 +2427,8 @@ def fit_vm_offsets(vm, data, wpos):
     совокупности: удачи без ×wpos, неудачи с 1/q) равна доле удач — отдельно наверху и у подзадач. Одного сдвига log w
     мало: ограничение нормы градиента срабатывает почти на каждой пачке с удачей и гасит её вес — по уровням по-разному."""
     vm.eval()
+    if data and isinstance(data[0], list):             # группы (кадр + его коалиции) → плоский список
+        data = [x for g in data for x in g]
     raw = []
     for s in range(0, len(data), 32):
         raw += vm([e[0] for e in data[s:s + 32]]).float().tolist()
@@ -2420,8 +2457,22 @@ def vm_point_loss(vm, b, wbar):
     return (F.binary_cross_entropy_with_logits(logits, y, reduction="none") * w).sum() / (len(b) * wbar)
 
 
+def vm_point_step(vm, groups, wbar, cfg, scale=1.0):
+    """Поточечная часть шага по группам (кадр + его коалиции): backward кусками не больше vm_batch текстов (пик
+    памяти — от куска), градиент в сумме — как у среднего по всем текстам пачки. → потеря пачки."""
+    flat = [x for g in groups for x in g]
+    tot = 0.0
+    for s in range(0, len(flat), cfg.vm_batch):
+        b = flat[s:s + cfg.vm_batch]
+        lp = vm_point_loss(vm, b, wbar) * (len(b) / len(flat))
+        (scale * lp).backward()
+        tot += lp.item()
+        del lp
+    return tot
+
+
 def train_vm(vm, examples, cfg, budget=None):
-    """VM поточечно: взвешенная бинарная кросс-энтропия (см. vm_point_data)."""
+    """VM поточечно: взвешенная бинарная кросс-энтропия (см. vm_point_data); пачка — vm_batch кадров с их коалициями."""
     data, wpos, wbar, npos = vm_point_data(examples, cfg, budget)
     if not data or wbar <= 0:
         return {}
@@ -2432,15 +2483,14 @@ def train_vm(vm, examples, cfg, budget=None):
         random.shuffle(data)
         for s in range(0, len(data), cfg.vm_batch):
             b = data[s:s + cfg.vm_batch]
-            loss = vm_point_loss(vm, b, wbar)
             opt.zero_grad()
-            loss.backward()
+            loss = vm_point_step(vm, b, wbar, cfg)
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
-            tot, n = tot + loss.item() * len(b), n + len(b)
+            tot, n = tot + loss * len(b), n + len(b)
     vm.logit_offset = fit_vm_offsets(vm, data, wpos)
-    return {"vm_loss": tot / max(1, n), "vm_pos": npos, "vm_n": len(data), "vm_w": round(wpos, 2),
-            "vm_offset": vm.logit_offset}
+    return {"vm_loss": tot / max(1, n), "vm_pos": npos, "vm_n": len(data), "vm_texts_point": sum(len(g) for g in data),
+            "vm_w": round(wpos, 2), "vm_offset": vm.logit_offset}
 
 
 def train_vm_pairs(vm, pairs, examples, cfg, budget=None, epochs=1):
@@ -2455,7 +2505,7 @@ def train_vm_pairs(vm, pairs, examples, cfg, budget=None, epochs=1):
     pw = sum(x[2] for x in pairs) / len(pairs)
     opt, params = vm_optimizer(vm, cfg)
     vm.train()
-    B = max(1, cfg.vm_batch // 2)                         # пар на шаг (две текста на пару) + столько же поточечных
+    B = max(1, cfg.vm_batch // 2)                         # пар на шаг (две текста на пару) + столько же кадров поточечно
     steps = max(math.ceil(len(pairs) / B), math.ceil(len(data) / B) if data and wbar > 0 else 0)
     tot_bt = tot_pt = acc = 0.0
     n, dd = 0, []
@@ -2473,11 +2523,9 @@ def train_vm_pairs(vm, pairs, examples, cfg, budget=None, epochs=1):
             tot_bt += loss.item()                           # пик памяти — от одной, а не от суммы
             acc += (d > 0).float().mean().item()
             del sc, d, loss
-            if dd and cfg.vm_point_weight > 0:
-                lp = vm_point_loss(vm, [dd[(s * B + i) % len(dd)] for i in range(min(B, len(dd)))], wbar)
-                (cfg.vm_point_weight * lp).backward()
-                tot_pt += lp.item()
-                del lp
+            if dd and cfg.vm_point_weight > 0:           # B кадров с их коалициями, кусками ≤ vm_batch текстов
+                tot_pt += vm_point_step(vm, [dd[(s * B + i) % len(dd)] for i in range(min(B, len(dd)))], wbar, cfg,
+                                        scale=cfg.vm_point_weight)
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
             n += 1
@@ -2486,7 +2534,7 @@ def train_vm_pairs(vm, pairs, examples, cfg, budget=None, epochs=1):
         vm.logit_offset = fit_vm_offsets(vm, data, wpos)
     return {"vm_pair_loss": round(tot_bt / max(1, n), 4), "vm_point_loss": round(tot_pt / max(1, n), 4),
             "vm_pair_train_acc": round(acc / max(1, n), 3), "vm_pairs": len(pairs), "vm_pos": npos, "vm_n": len(data),
-            "vm_w": round(wpos, 2), "vm_offset": vm.logit_offset}
+            "vm_texts_point": sum(len(g) for g in data), "vm_w": round(wpos, 2), "vm_offset": vm.logit_offset}
 
 
 def held_task(request):
@@ -2533,7 +2581,9 @@ def auc(scores, labels):
 
 def vm_game(vm, frames, cfg, refresh=1.0):
     """Shapley по шагам уровня в игре VM → step['phi'] (метка RM). refresh < 1 (предл., ради времени): метки
-    пересчитываются у всех новых кадров и у такой доли старых; остальные старые хранят метки прошлой VM."""
+    пересчитываются у всех новых кадров и у такой доли старых; остальные старые хранят метки прошлой VM.
+    В метриках v_empty_* и v_full_* — средние v(без шагов) и v(вся траектория) по уровням: v_empty_top должна быть
+    около доли удач и ниже v_full_top у удач; v_empty заметно выше v_full — VM не видела коалиций (vm_coalitions)."""
     jobs, texts = [], []
     for f in frames:
         m = len(f["steps"])
@@ -2545,9 +2595,12 @@ def vm_game(vm, frames, cfg, refresh=1.0):
         jobs.append((f, m, subsets, len(texts)))
         texts += [vm_text(f, set(S)) for S in subsets]
     probs = vm_probs(vm, texts)
-    phis, by = [], {}
+    phis, by, vals = [], {}, {}
     for f, m, subsets, off in jobs:
         v = {S: probs[off + k] for k, S in enumerate(subsets)}
+        lvl = "top" if f["level"] == 0 else "sub"
+        vals.setdefault(f"v_empty_{lvl}", []).append(v[()])
+        vals.setdefault(f"v_full_{lvl}", []).append(v[tuple(range(m))])
         for st, ph in zip(f["steps"], shapley(m, v)):
             st["phi"] = ph
             phis.append(ph)
@@ -2555,7 +2608,8 @@ def vm_game(vm, frames, cfg, refresh=1.0):
             by.setdefault(f"phi_{'top' if f['level'] == 0 else 'sub'}_{kind}", []).append(ph)
     return {"phi_mean": float(np.mean(phis)) if phis else 0.0, "phi_abs": float(np.mean(np.abs(phis))) if phis else 0.0,
             "vm_texts": len(texts), **{k: round(float(np.mean(v)), 4) for k, v in sorted(by.items())},
-            **{"n_" + k[4:]: len(v) for k, v in sorted(by.items())}}
+            **{"n_" + k[4:]: len(v) for k, v in sorted(by.items())},
+            **{k: round(float(np.mean(v)), 4) for k, v in sorted(vals.items())}}
 
 
 def vm_diagnostics(vm, frames):
@@ -3908,7 +3962,7 @@ def run_full_(cfg, D, an, seed, boot_frames, bc_frames, pairs, vocab, eval_tasks
         for k in [k for k in replay_cache if k < it + 2 - cfg.replay_iters]:
             del replay_cache[k]
         m = {"it": it + 1, "rollout": episode_stats(tops, frames)}
-        fresh = vm_examples(frames, cfg, levels=True)   # проверка VM на новых эпизодах — до обучения на них
+        fresh = vm_examples(frames, cfg)                # проверка VM на новых эпизодах — до обучения на них
         pre = vm_probs(vm, [e[0] for e in fresh]) if fresh else []
         held = [held_task(f["root_query"]) for f in frames if f["steps"]]   # задачи вне обучения VM — отдельно
         pre0 = vm_probs(vm, [vm_text(f, set()) for f in frames if f["steps"]]) if fresh else []
@@ -4393,8 +4447,20 @@ def dry_check():
           {"level": 1, "steps": [none], "root_R": 1.0, "request": "q", "answer": None, "path": ["p"]},
           {"level": 1, "steps": [], "root_R": 1.0, "request": "q", "answer": None, "path": ["p"]}]
     sw = CFG.sub_weight
-    assert [(y, w) for _, y, w in vm_examples(fr, CFG)] == [(0.0, 1.0), (0.0, sw), (1.0, sw), (0.0, sw)], \
+    assert [(y, w) for _, y, w, *_ in vm_examples(fr, CFG)] == [(0.0, 1.0), (0.0, sw), (1.0, sw), (0.0, sw)], \
         "метки VM: подзадача с ответом при нерешённой задаче должна быть «0» и идти в обучение"
+    # коалиции для поточечного обучения VM: пустая (без шагов) + случайные неполные, метка и запрос — кадра
+    st2 = {"reqs": [{"dest": "LLM", "text": "a", "result": "1"}], "answer": None}
+    fr2 = {"level": 0, "steps": [st2, st2, ans], "R": 1.0, "request": "q", "answer": "x"}
+    ck3 = replace(CFG, vm_coalitions=3)
+    groups = vm_point_data(vm_examples([fr2], ck3), ck3)[0]
+    g = groups[0]
+    assert len(groups) == 1 and len(g) == 4 and len({t for t, _, _ in g}) == 4 and all(y == 1.0 for _, y, _ in g), g
+    assert g[0][0] == vm_text(fr2) and g[1][0] == vm_text(fr2, set()) and "\nS" not in g[1][0], "пустая коалиция: только запрос"
+    assert all(t != g[0][0] and t.startswith("REQUEST") for t, _, _ in g[1:]), "коалиции должны быть неполными"
+    assert len(vm_point_data(vm_examples(fr[:1], ck3), ck3)[0][0]) == 2, "у кадра с одним шагом неполная коалиция одна — пустая"
+    assert len(vm_point_data([("t", 1.0, 1.0)], ck3)[0][0]) == 1, "пример без кадра — без коалиций"
+    assert len(vm_point_data(vm_examples([fr2], replace(CFG, vm_coalitions=0)), replace(CFG, vm_coalitions=0))[0][0]) == 1
     assert [is_sub_text(vm_text(f)) for f in fr[:2]] == [False, True], "уровень по тексту VM определяется неверно"
     st_ = {"reqs": [{"dest": "SUB", "text": "Assume X is a knight. Who is who? = X is a knight, Y is a knave", "result": "X is a knight, Y is a knight"},
                     {"dest": "LLM", "text": "Is Y a knight?", "result": "no"}], "answer": None}
