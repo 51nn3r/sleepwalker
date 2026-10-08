@@ -168,6 +168,8 @@ class Config:
     head_dim: int = 256
     head_layers: int = 2
     rm_loss_scale: float = 1.0      # вес потери RM внутри модели мира (метки приведены к единичному разбросу)
+    rm_anchor: bool = True          # игра VM как в SCAR (предл.): v(пусто) = 0, v(вся) = настоящий исход кадра (R / root_R);
+    #                                 VM задаёт только промежуточные коалиции, т. е. делит настоящую награду между шагами
     critic_lr: float = 3e-4
     horizon: int = 5                # горизонт воображения; = max_steps, чтобы в воображении был виден конец ходов: при
     #                                 коротком горизонте «продолжать» всегда выигрывало у «ответить» (бутстрап критика
@@ -2776,6 +2778,13 @@ def auc(scores, labels):
     return float((p[:, None] > q[None, :]).mean() + 0.5 * (p[:, None] == q[None, :]).mean())
 
 
+def frame_label(f):
+    """Настоящий исход кадра: наверху — R; у подзадачи — исход задачи наверху, если она дала ответ, иначе 0."""
+    if f["level"] == 0:
+        return 1.0 if f.get("R", 0.0) > 0.5 else 0.0
+    return 1.0 if f.get("answer") is not None and f.get("root_R", 0.0) > 0.5 else 0.0
+
+
 def vm_game(vm, frames, cfg, refresh=1.0):
     """Shapley по шагам уровня в игре VM → step['phi'] (метка RM). refresh < 1 (предл., ради времени): метки
     пересчитываются у всех новых кадров и у такой доли старых; остальные старые хранят метки прошлой VM.
@@ -2796,8 +2805,10 @@ def vm_game(vm, frames, cfg, refresh=1.0):
     for f, m, subsets, off in jobs:
         v = {S: probs[off + k] for k, S in enumerate(subsets)}
         lvl = "top" if f["level"] == 0 else "sub"
-        vals.setdefault(f"v_empty_{lvl}", []).append(v[()])
+        vals.setdefault(f"v_empty_{lvl}", []).append(v[()])    # оценки самой VM (диагностика: читает ли она шаги)
         vals.setdefault(f"v_full_{lvl}", []).append(v[tuple(range(m))])
+        if cfg.rm_anchor:                             # как в SCAR: сумма заслуг кадра — настоящий исход, не оценка VM
+            v[()], v[tuple(range(m))] = 0.0, float(frame_label(f))
         for st, ph in zip(f["steps"], shapley(m, v)):
             st["phi"] = ph
             phis.append(ph)
@@ -4833,6 +4844,14 @@ def dry_check():
             assert coalition_next(f, t_, tuple(range(k)), k, CFG) == st_["next_state"], (f["request"], t_)
             n_cf += 1
     print(f"контрфакты: полная коалиция совпала с настоящим переходом во всех {n_cf} шагах")
+    shp = load_json_gz(os.path.join(RunDirs(os.path.join(BASE_DIR, "dry_test")).traj, "world_model_seed0", "dataset_with_shapley.json.gz"))
+    n_anc = 0                                         # якорь SCAR: сумма заслуг кадра = его настоящий исход
+    for f in shp:
+        if f["steps"] and all("phi" in st for st in f["steps"]):
+            assert abs(sum(st["phi"] for st in f["steps"]) - frame_label(f)) < 1e-6, (f["request"], [st["phi"] for st in f["steps"]])
+            n_anc += 1
+    assert n_anc > 0, "метки Shapley не найдены"
+    print(f"якорь игры VM: сумма заслуг равна исходу во всех {n_anc} кадрах")
     res_kk = run(Config.dry(task="kk"), "dry_test_kk")
     Dk = RunDirs(os.path.join(BASE_DIR, "dry_test_kk"))
     js = load_json(os.path.join(Dk.judge, "summary.json"))
