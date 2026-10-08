@@ -168,8 +168,10 @@ class Config:
     head_dim: int = 256
     head_layers: int = 2
     rm_loss_scale: float = 1.0      # вес потери RM внутри модели мира (метки приведены к единичному разбросу)
-    rm_anchor: bool = True          # игра VM как в SCAR (предл.): v(пусто) = 0, v(вся) = настоящий исход кадра (R / root_R);
-    #                                 VM задаёт только промежуточные коалиции, т. е. делит настоящую награду между шагами
+    rm_anchor: bool = True          # якорь концов игры VM (предл.): v(пусто) = 0, как в SCAR; v(вся) = настоящий исход кадра —
+    #                                 VM задаёт только промежуточные коалиции, т. е. делит исход между шагами (сдвиг заслуг
+    #                                 кадра на одну величину; порядок шагов внутри кадра остаётся за VM)
+    rm_split: str = "vm"            # vm — деление по игре VM; uniform — поровну (исход/шагов) без VM: контрольное плечо
     critic_lr: float = 3e-4
     horizon: int = 5                # горизонт воображения; = max_steps, чтобы в воображении был виден конец ходов: при
     #                                 коротком горизонте «продолжать» всегда выигрывало у «ответить» (бутстрап критика
@@ -751,7 +753,7 @@ class ArithTask:
         n = parse_number(text)
         return str(n) if n is not None else (((text or "").strip().splitlines() or ["?"])[0][:30] or "?")
 
-    def sub_truth(self, request):
+    def sub_truth(self, request, root_truth=None):
         return safe_eval(request)
 
     def compact(self, text):
@@ -966,8 +968,10 @@ class KKTask:
         return found
 
     def check(self, answer, truth):
+        if truth == "contradiction":
+            return bool(answer) and answer.strip().lower().startswith("contradiction")
         found = self.roles(answer)
-        return bool(truth) and all(found.get(n) == v for n, v in truth.items())
+        return bool(truth) and isinstance(truth, dict) and all(found.get(n) == v for n, v in truth.items())
 
     ASSUME_RE = re.compile(r"\b([A-Z][a-z]+) is (?:a |an )?(knight|knave)\b")
     PLURAL_RE = re.compile(r"((?:\b[A-Z][a-z]+\b(?:\s*,\s*|\s+and\s+))+\b[A-Z][a-z]+\b) are (?:both |all )?(knights|knaves)\b")
@@ -999,8 +1003,16 @@ class KKTask:
         text = (text or "").strip()
         return text.splitlines()[0][:200] if text else "?"
 
-    def sub_truth(self, request):
-        return None
+    def sub_truth(self, request, root_truth=None):
+        """Истина подзадачи-допущения (предл.): допущения согласны с эталоном корня — роли эталона, иначе «contradiction»;
+        без допущений или без вопроса «кто кто?» — неизвестно (None). Так заслуга шагов подзадачи считается по её
+        собственной правильности, а не по исходу корня."""
+        if not isinstance(root_truth, dict) or not self.KK_ASK.search(request or ""):
+            return None
+        pairs = self.assumptions(request)
+        if not pairs:
+            return None
+        return root_truth if all(root_truth.get(n) == (r == "knight") for n, r in pairs if n in root_truth) else "contradiction"
 
     KK_INTRO = re.compile(r"A very special island is inhabited only by knights and knaves\. Knights always tell the "
                           r"truth, and knaves always lie\. ")
@@ -2453,7 +2465,7 @@ def run_episodes(tasks, actor, cfg, mode, wm=None, codec=None, greedy=False, few
 
                     if r["dest"] == "SUB":                  # подзадача получает весь путь к этому шагу (ваше)
                         ch = new_frame(frames, r["text"], f["level"] + 1, (f["id"], si, j),
-                                       TASK.sub_truth(r["text"]), f["root_query"], context_block(f, si),
+                                       TASK.sub_truth(r["text"], frames[root].get("truth")), f["root_query"], context_block(f, si),
                                        sub_allow(cfg, f["level"] + 1))
                         r["child"] = ch["id"]
                         root_of[ch["id"]] = root
@@ -2558,8 +2570,7 @@ def vm_examples(frames, cfg):
         if not f["steps"]:
             continue
         top = f["level"] == 0
-        r = f.get("R", 0.0) if top else (f.get("root_R", 0.0) if f["answer"] is not None else 0.0)
-        y, w = (1.0 if r > 0.5 else 0.0), (1.0 if top else cfg.sub_weight)
+        y, w = frame_label(f), (1.0 if top else cfg.sub_weight)   # подзадача — своя правильность, если известна
         ex.append((vm_text(f), y, w, top, f))
     return ex
 
@@ -2573,7 +2584,7 @@ def vm_coalition_examples(f, y, w, cfg):
     m, n = len(f["steps"]), max(0, cfg.vm_coalitions)
     if m == 0 or n == 0:
         return []
-    subsets = [set()]
+    subsets = [] if cfg.rm_anchor else [set()]          # при якоре пустую коалицию игра не спрашивает
     if m <= 10:
         pool = [S for r in range(1, m) for S in itertools.combinations(range(m), r)]
         subsets += [set(S) for S in random.sample(pool, min(n - 1, len(pool)))]
@@ -2779,9 +2790,12 @@ def auc(scores, labels):
 
 
 def frame_label(f):
-    """Настоящий исход кадра: наверху — R; у подзадачи — исход задачи наверху, если она дала ответ, иначе 0."""
+    """Настоящий исход кадра: наверху — R; у подзадачи — её собственная правильность (sub_ok), если истина подзадачи
+    известна (арифметика; K&K-допущения по эталону корня), иначе исход корня при наличии ответа."""
     if f["level"] == 0:
         return 1.0 if f.get("R", 0.0) > 0.5 else 0.0
+    if f.get("sub_ok") is not None:
+        return 1.0 if f["sub_ok"] else 0.0
     return 1.0 if f.get("answer") is not None and f.get("root_R", 0.0) > 0.5 else 0.0
 
 
@@ -2791,6 +2805,14 @@ def vm_game(vm, frames, cfg, refresh=1.0):
     В метриках v_empty_* и v_full_* — средние v(без шагов) и v(вся траектория) по уровням: v_empty_top должна быть
     около доли удач и ниже v_full_top у удач; v_empty заметно выше v_full — VM не видела коалиций (vm_coalitions)."""
     jobs, texts = [], []
+    if cfg.rm_split == "uniform":                      # контрольное плечо: исход поровну между шагами, VM не участвует
+        n = 0
+        for f in frames:
+            m = len(f["steps"])
+            for st in f["steps"]:
+                st["phi"] = frame_label(f) / m
+            n += m
+        return {"phi_mean": float(np.mean([st["phi"] for f in frames for st in f["steps"]])) if n else 0.0, "vm_texts": 0, "rm_split": "uniform"}
     for f in frames:
         m = len(f["steps"])
         if m == 0:
@@ -2805,17 +2827,24 @@ def vm_game(vm, frames, cfg, refresh=1.0):
     for f, m, subsets, off in jobs:
         v = {S: probs[off + k] for k, S in enumerate(subsets)}
         lvl = "top" if f["level"] == 0 else "sub"
-        vals.setdefault(f"v_empty_{lvl}", []).append(v[()])    # оценки самой VM (диагностика: читает ли она шаги)
+        out = "ok" if frame_label(f) > 0.5 else "fail"
+        vals.setdefault(f"v_empty_{lvl}", []).append(v[()])    # оценки самой VM (без якоря): читает ли она шаги
         vals.setdefault(f"v_full_{lvl}", []).append(v[tuple(range(m))])
-        if cfg.rm_anchor:                             # как в SCAR: сумма заслуг кадра — настоящий исход, не оценка VM
+        if lvl == "top":
+            vals.setdefault(f"v_full_top_{out}", []).append(v[tuple(range(m))])
+        if cfg.rm_anchor:                             # якорь концов: сумма заслуг кадра — исход, не оценка VM
             v[()], v[tuple(range(m))] = 0.0, float(frame_label(f))
-        for st, ph in zip(f["steps"], shapley(m, v)):
+        phi_f = shapley(m, v)
+        if lvl == "top" and m >= 2 and f["steps"][-1].get("answer") is not None:   # деление: ANSWER против запросов
+            req = [ph for st, ph in zip(f["steps"], phi_f) if st.get("answer") is None]
+            vals.setdefault(f"split_against_answer_{out}", []).append(float(phi_f[-1] < np.mean(req)))
+        for st, ph in zip(f["steps"], phi_f):
             st["phi"] = ph
             phis.append(ph)
             kind = "answer" if st.get("answer") is not None else ("requests" if st.get("reqs") else "empty")
             by.setdefault(f"phi_{'top' if f['level'] == 0 else 'sub'}_{kind}", []).append(ph)
-            if f["level"] == 0 and kind == "answer":       # читает ли VM ответ: заслуга ANSWER у удач против неудач
-                by.setdefault(f"phi_top_answer_{'ok' if f.get('R', 0.0) > 0.5 else 'fail'}", []).append(ph)
+            if f["level"] == 0 and kind in ("answer", "requests"):   # заслуги по исходу: при якоре смотреть на fail-кадры
+                by.setdefault(f"phi_top_{kind}_{out}", []).append(ph)
     return {"phi_mean": float(np.mean(phis)) if phis else 0.0, "phi_abs": float(np.mean(np.abs(phis))) if phis else 0.0,
             "vm_texts": len(texts), **{k: round(float(np.mean(v)), 4) for k, v in sorted(by.items())},
             **{"n_" + k[4:]: len(v) for k, v in sorted(by.items())},
@@ -4694,13 +4723,16 @@ def dry_check():
     # коалиции для поточечного обучения VM: пустая (без шагов) + случайные неполные, метка и запрос — кадра
     st2 = {"reqs": [{"dest": "LLM", "text": "a", "result": "1"}], "answer": None}
     fr2 = {"level": 0, "steps": [st2, st2, ans], "R": 1.0, "request": "q", "answer": "x"}
-    ck3 = replace(CFG, vm_coalitions=3)
+    ck3 = replace(CFG, vm_coalitions=3, rm_anchor=False)
     groups = vm_point_data(vm_examples([fr2], ck3), ck3)[0]
     g = groups[0]
     assert len(groups) == 1 and len(g) == 4 and len({t for t, _, _ in g}) == 4 and all(y == 1.0 for _, y, _ in g), g
     assert g[0][0] == vm_text(fr2) and g[1][0] == vm_text(fr2, set()) and "\nS" not in g[1][0], "пустая коалиция: только запрос"
     assert all(t != g[0][0] and t.startswith("REQUEST") for t, _, _ in g[1:]), "коалиции должны быть неполными"
     assert len(vm_point_data(vm_examples(fr[:1], ck3), ck3)[0][0]) == 2, "у кадра с одним шагом неполная коалиция одна — пустая"
+    ck3a = replace(CFG, vm_coalitions=3, rm_anchor=True)
+    ga = vm_point_data(vm_examples([fr2], ck3a), ck3a)[0][0]
+    assert len(ga) == 3 and all(t != vm_text(fr2, set()) for t, _, _ in ga), "при якоре пустая коалиция не нужна"
     assert len(vm_point_data([("t", 1.0, 1.0)], ck3)[0][0]) == 1, "пример без кадра — без коалиций"
     assert len(vm_point_data(vm_examples([fr2], replace(CFG, vm_coalitions=0)), replace(CFG, vm_coalitions=0))[0][0]) == 1
     assert [is_sub_text(vm_text(f)) for f in fr[:2]] == [False, True], "уровень по тексту VM определяется неверно"
@@ -4791,6 +4823,12 @@ def dry_check():
     assert repeats_question("Assume James is a knave. Who is a knight and who is a knave?", q0, []), "переворот своего допущения (K&K)"
     assert not repeats_question("If James is a knight, is Liam a knight?", q0, []), "узкий вопрос при тех же допущениях — не копия"
     assert not repeats_question("Assume James is a knight. Assume Liam is a knave. Who is a knight and who is a knave?", q0, []), "двухфразное сужение"
+    tr = {"A": True, "B": False}                      # истина подзадачи-допущения по эталону корня
+    assert kk.sub_truth("Assume A is a knight. Who is a knight and who is a knave?", tr) == tr
+    assert kk.sub_truth("Assume A is a knave. Who is a knight and who is a knave?", tr) == "contradiction"
+    assert kk.sub_truth("Is B a knight?", tr) is None and kk.sub_truth(q0, None) is None
+    assert kk.check("contradiction", "contradiction") and not kk.check("A is a knight, B is a knave", "contradiction")
+    assert frame_label({"level": 1, "sub_ok": True, "answer": "x", "root_R": 0.0}) == 1.0 and frame_label({"level": 1, "sub_ok": None, "answer": "x", "root_R": 1.0}) == 1.0
     set_task(CFG)
     class Stop(Exception):
         pass
