@@ -181,7 +181,7 @@ class Config:
     gamma: float = 0.97
     lam_ret: float = 0.95
     repval_scale: float = 1.0       # вес настоящих возвратов у критика (против оптимизма бутстрапа)
-    ret_scale_floor: float = 1e-3   # масштаб возвратов (P95 − P5) не ниже этого: возвраты здесь — доли P(успеха), ~0.01,
+    ret_scale_floor: float = 0.05   # масштаб возвратов (P95 − P5) не ниже этого: возвраты здесь — доли P(успеха), ~0.01,
     #                                 и порог max(1, S) из DreamerV3 оставлял актору сигнал ~0.003 (актор не учился)
     adv_clip: float = 5.0           # |A_t| и |φ| после масштабирования — не больше
     bad_action_penalty: float = 1.0 # штраф за неправильное действие (ваше), в тех же единицах, что φ после масштаба:
@@ -3410,10 +3410,12 @@ def bad_action(text, reqs, ans, last, allow_sub, cfg, repeats=0):
 
 
 def token_weights(actor, gen, lines, base, extra):
-    """Вес каждого токена действия: base для всех + extra[i] для токенов строки-игрока i. Строки сопоставляются целиком
-    (игрок, процитированный в мыслях, не крадёт их токены); начала токенов — по префиксному декодированию, чтобы
-    многобайтовые символы (кириллица) не ломали позиции."""
-    w = [base] * len(gen)
+    """Вес каждого токена действия. base — на всё действие (делится между всеми его токенами), extra[i] — заслуга
+    строки-игрока i (делится между токенами строки): суммарный вес действия не зависит от длины текста — с мыслями
+    действие в 3–4 раза длиннее, и без деления штраф и заслуги росли вместе с длиной (v9: pg 0.72 против 0.02, KL 0.53
+    за итерацию, формат развалился). Строки сопоставляются целиком (игрок, процитированный в мыслях, не крадёт их
+    токены); начала токенов — по префиксному декодированию (кириллица)."""
+    w = [base / max(1, len(gen))] * len(gen)
     if not lines or not any(extra):
         return w
     if hasattr(actor, "piece_starts"):
@@ -3439,10 +3441,11 @@ def token_weights(actor, gen, lines, base, extra):
         else:
             used.add(hit)
             spans.append(rows[hit][:2])
+    n_in = [sum(1 for st in starts if a <= st < b) for a, b in spans]
     for t, st in enumerate(starts):
         for i, (a, b) in enumerate(spans):
             if a <= st < b:
-                w[t] += extra[i]
+                w[t] += extra[i] / max(1, n_in[i])
     return w
 
 
@@ -3649,7 +3652,8 @@ def imagine_round(actor, actor_opt, wm, critic, critic_tgt, critic_opt, codec, s
         advs.append(a)
         phi_abs += [abs(clip(x / scale)) for x in phi]
     st = actor_steps(actor, actor_opt, items, cfg)
-    st.update({"critic_loss": float(np.mean(losses_c)), "imag_steps": len(pairs),
+    st.update({"critic_loss": float(np.mean(losses_c)), "imag_steps": len(pairs), "ret_scale": round(float(scale), 5),
+               "clip_rate": float(np.mean([abs(x) >= cfg.adv_clip - 1e-9 for x in phi_abs])) if phi_abs else 0.0,
                "imag_answer_rate": float(np.mean([s["answer"] is not None for _, s in flat])),
                "adv_abs": float(np.mean(np.abs(advs))), "phi_abs": float(np.mean(phi_abs)) if phi_abs else 0.0,
                "multi_player_steps": sum(len(s["players"]) >= 2 for _, s in flat),
@@ -4239,6 +4243,9 @@ def run_full_(cfg, D, an, seed, boot_frames, bc_frames, pairs, vocab, eval_tasks
         for k in [k for k in replay_cache if k < it + 2 - cfg.replay_iters]:
             del replay_cache[k]
         m = {"it": it + 1, "rollout": episode_stats(tops, frames)}
+        if m["rollout"].get("answered", 1.0) < 0.5:
+            log(f"!!! ВНИМАНИЕ [{an}]: актор перестал отвечать (answered {m['rollout']['answered']:.2f}) — обновление "
+                "актора слишком сильное (см. kl, pg, clip_rate прошлой итерации); имеет смысл остановить прогон")
         fresh = vm_examples(frames, cfg)                # проверка VM на новых эпизодах — до обучения на них
         pre = vm_probs(vm, [e[0] for e in fresh]) if fresh else []
         held = [held_task(f["root_query"]) for f in frames if f["steps"]]   # задачи вне обучения VM — отдельно
@@ -4766,8 +4773,9 @@ def dry_check():
     assert bad_action("PLAN: p\nSUB: q?", [{"dest": "LLM"}], None, False, True, CFG, repeats=1) == (0.5, ["repeat_request"])
     class _P:                                          # мысли первой строкой и цитируют игрока: спан игрока — его строка
         pieces = staticmethod(lambda gen: ["THOUGHTS:", " ask LLM: 3 + 4", "\n", "PLAN:", " p", "\n", "LLM:", " 3 + 4"])
-    assert token_weights(_P, list(range(8)), ["PLAN: p", "LLM: 3 + 4", "THOUGHTS: ask LLM: 3 + 4"], -1.0, [2.0, 3.0, 5.0]) == \
-        [4.0, 4.0, -1.0, 1.0, 1.0, -1.0, 2.0, 2.0]
+    tw_ = token_weights(_P, list(range(8)), ["PLAN: p", "LLM: 3 + 4", "THOUGHTS: ask LLM: 3 + 4"], -1.0, [2.0, 3.0, 5.0])
+    assert [round(x, 3) for x in tw_] == [2.375, 2.375, -0.125, 0.875, 0.875, -0.125, 1.375, 1.375], tw_
+    assert abs(sum(tw_) - (-1.0 + 2.0 + 3.0 + 5.0)) < 1e-9, "суммарный вес действия = база + заслуги строк"
     assert transitions([{"level": 0, "steps": [{"state": "s", "action": act_t, "next_state": "n"}]}], CFG)[0][1] == "PLAN: p\nSUB: q?\nLLM: r"
     assert parse_thoughts("PLAN: p\nANSWER: x\nTHOUGHTS: late") == (None, None)
     # страховка от копий: универсально — те же слова; сужение не ловится
