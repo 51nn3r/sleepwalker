@@ -2803,6 +2803,8 @@ def vm_game(vm, frames, cfg, refresh=1.0):
             phis.append(ph)
             kind = "answer" if st.get("answer") is not None else ("requests" if st.get("reqs") else "empty")
             by.setdefault(f"phi_{'top' if f['level'] == 0 else 'sub'}_{kind}", []).append(ph)
+            if f["level"] == 0 and kind == "answer":       # читает ли VM ответ: заслуга ANSWER у удач против неудач
+                by.setdefault(f"phi_top_answer_{'ok' if f.get('R', 0.0) > 0.5 else 'fail'}", []).append(ph)
     return {"phi_mean": float(np.mean(phis)) if phis else 0.0, "phi_abs": float(np.mean(np.abs(phis))) if phis else 0.0,
             "vm_texts": len(texts), **{k: round(float(np.mean(v)), 4) for k, v in sorted(by.items())},
             **{"n_" + k[4:]: len(v) for k, v in sorted(by.items())},
