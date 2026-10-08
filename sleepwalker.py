@@ -801,7 +801,8 @@ class KKTask:
                 "повтори допущения этого уровня и добавь одно новое.")
     block_exec = "головоломка о рыцарях (knight) и лжецах (knave): рыцари всегда говорят правду, лжецы всегда лгут. отвечай по-английски."
     _q = ("A very special island is inhabited only by knights and knaves. Knights always tell the truth, and knaves always lie. You meet 3 inhabitants: Zoey, Ethan and Mia. Zoey says: \"Ethan is a knave or Mia is a knight.\" Ethan says: \"Mia is a knight or Zoey is a knight.\" Mia says: \"Zoey is a knight if and only if Ethan is a knight.\" Who is a knight and who is a knave?")
-    _sub = PATH_HEAD + "\n[L0] Q: " + _q + "\n" + Q_SUB + " Assume Zoey is a %s. Who is a knight and who is a knave?\nL: 1/{L} T: 0/{T}"
+    _sub = (PATH_HEAD + "\n[L0] Q: " + _q + "\n[L0] P: split on Zoey, then pick the consistent case and answer\n" + Q_SUB +
+            " Assume Zoey is a %s. Who is a knight and who is a knave?\nL: 1/{L} T: 0/{T}")
     shots_top = [
         ("Q: " + _q + "\nL: 0/{L} T: 0/{T}",
          "THOUGHTS: three statements and no roles known yet; Zoey's role decides the others, so I split on Zoey.\n"
@@ -823,7 +824,8 @@ class KKTask:
          "CRITICS: the contradiction follows directly, no sub-task is needed; the answer must be the word contradiction.\n"
          "PLAN: Zoey lies, so Ethan is a knight and Mia is a knave; then Ethan's statement is false, impossible\n"
          "ANSWER: contradiction"),
-        (PATH_HEAD + "\n[L0] Q: " + _q + "\n" + Q_SUB + " Assume Mia is a knave. Who is a knight and who is a knave?\nL: 1/{L} T: 0/{T}",
+        (PATH_HEAD + "\n[L0] Q: " + _q + "\n[L0] P: split on Mia, then pick the consistent case and answer\n" + Q_SUB +
+         " Assume Mia is a knave. Who is a knight and who is a knave?\nL: 1/{L} T: 0/{T}",
          "THOUGHTS: Mia is already assumed a knave, so Zoey and Ethan differ in role; which one is the knight is still open.\n"
          "CRITICS: I must not re-ask the question I was given, so each sub-task keeps Mia knave and adds Zoey's role.\n"
          "PLAN: split on Zoey\n"
@@ -1207,8 +1209,10 @@ def trim_path(path, max_chars):
 
 
 def context_block(f, si):
-    """Путь к шагу si кадра f (ваше): путь кадра + его вопрос + шаги до si с результатами (по уровням)."""
-    return list(f.get("path", ())) + [f"[L{f['level']}] Q: {f['request']}"] + \
+    """Путь к шагу si кадра f (ваше): путь кадра + его вопрос + его план (ваше: подзадаче даны план и этапы всех
+    уровней) + шаги до si с результатами (по уровням)."""
+    plan = next((x["plan"] for x in reversed(f["steps"][:si]) if x.get("plan")), None)
+    return list(f.get("path", ())) + [f"[L{f['level']}] Q: {f['request']}"] + ([f"[L{f['level']}] P: {plan}"] if plan else []) + \
         [f"[L{f['level']}] {x}" for i, st in enumerate(f["steps"][:si], 1) for x in step_line(i, st).split("\n")]
 
 
@@ -1349,8 +1353,8 @@ ACTOR_INTRO = ("ты исполняешь этап решения задачи. 
 PLAN_DOC = ("план решения задачи разделенный на этапы. план можно менять по своему усмотрению. если строки P нет - "
             "придумай план. план не обязательно должен быть целым - можно писать пункт \"придумать дальнейшую часть "
             "плана\". в одном этапе плана могут быть несколько целей \"сделать A и B\"")
-STATE_FORMAT = ("PATH: контекст уровней выше, только для чтения: строки [L<n>] Q: задача уровня n и [L<n>] S<k>: / [L<n>] R<k>: "
-                "его запросы и результаты (\"[...]\" - пропущенные строки). на верхнем уровне PATH нет\n"
+STATE_FORMAT = ("PATH: контекст уровней выше, только для чтения: строки [L<n>] Q: задача уровня n, [L<n>] P: его план, "
+                "[L<n>] S<k>: / [L<n>] R<k>: его запросы и результаты (\"[...]\" - пропущенные строки). на верхнем уровне PATH нет\n"
                 "Q: твоя задача; на подуровне она помечена \"Q (answer only this question)\"\n"
                 "L: уровень/макс T: этапы использовано/всего SUB: сколько подзадач еще можно вызвать - одной строкой. оставь "
                 "последний этап на ответ\n"
@@ -1375,7 +1379,8 @@ ACTOR_SUB = ("3. вызвать подзадачу. в этом случае р�
              "сколько осталось - в строке SUB. верни строку:\nSUB: <подзадача>")
 ACTOR_RULES = "других строк не пиши; в запросах не используй \" ; \" и \" = \"."
 EXEC_BASE = ("ты отвечаешь на запрос по ходу решения задачи. ввод в формате:\n"
-             "CONTEXT (read-only): контекст уровней: [L<n>] Q: задача уровня n; [L<n>] S<k>: / [L<n>] R<k>: его запросы и результаты\n"
+             "CONTEXT (read-only): контекст уровней: [L<n>] Q: задача уровня n; [L<n>] P: его план; [L<n>] S<k>: / [L<n>] R<k>: его "
+             "запросы и результаты\n"
              "QUESTION (answer only this): запрос для тебя. это может быть вопрос, todo, инструкции и т.п.\n\n"
              "верни только ответ на QUESTION одной короткой строкой, не повторяя вопрос.")
 
