@@ -17,6 +17,8 @@
 #   3) experiment, one arm per GPU, in parallel:
 #        ./run_server.sh --stage experiment --arms full      --gpu 0
 #        ./run_server.sh --stage experiment --arms grpo_text --gpu 1
+#   Другой актор (7B в 4 битах, bitsandbytes; пачки генерации вдвое меньше, время ×3–4):
+#        ./run_server.sh --tasks 1000 --gpu 0 --state-dir exp_X --actor Qwen/Qwen2.5-7B-Instruct --quant 4bit
 #
 # Runs live in ./sleepwalker_runs by default; --state-dir DIR puts them elsewhere (e.g. a bigger disk): add it to every command.
 # Status (no need to stay logged in):   ./run_server.sh --status            (running runs only; -v: all runs, more lines)
@@ -32,6 +34,7 @@ if [ ! -d venv ]; then
   python3 -m venv venv
   ./venv/bin/pip install -q -U pip
   ./venv/bin/pip install -q torch transformers peft accelerate datasets
+  ./venv/bin/pip install -q bitsandbytes || echo "bitsandbytes не поставился: --quant 4bit работать не будет"
 fi
 case " $* " in
   *" --status "*|*" --stop "*|*" --dry "*) exec ./venv/bin/python3 sleepwalker.py "$@" ;;

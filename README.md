@@ -19,4 +19,4 @@ Outputs: `sleepwalker_runs/<run>/logs/` (log, config, results, trajectories, jud
 and `sleepwalker_runs/<run>/weights/`. `README.txt` inside a run folder explains every file.
 
 Server: `./run_server.sh --gpu 0` runs everything on all training tasks; `--tasks N` for a smaller run, `--iterations K`,
-`--stage`, `--shard i/n`, `--arms`, `--status`, `--dry` — see the header of `run_server.sh`.
+`--stage`, `--shard i/n`, `--arms`, `--actor MODEL`, `--quant 4bit`, `--status`, `--dry` — see the header of `run_server.sh`.

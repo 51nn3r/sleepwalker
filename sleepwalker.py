@@ -105,6 +105,7 @@ class Config:
     actor_model: str = "Qwen/Qwen2.5-1.5B-Instruct"   # актор; без адаптера он же исполняет запросы «LLM»
     vm_model: str = "answerdotai/ModernBERT-base"   # BERT-подобная; декодер (например, Qwen) тоже можно — с LoRA
     actor_lora_r: int = 64
+    actor_quant: str = ""           # "4bit" — NF4 через bitsandbytes (QLoRA): 7B помещается на 24 ГБ (флаг --quant 4bit)
     vm_lora_r: int = 32
     # задача: вложенная арифметика
     depth: int = 3                  # глубина дерева выражения (30% задач — на 1 меньше)
@@ -135,6 +136,7 @@ class Config:
     max_state_tokens: int = 320
     max_action_tokens: int = 96     # действие во входе модели мира (её токены)
     gen_action_tokens: int = 96     # сколько токенов актор может написать за ход
+    thoughts: bool = True           # актор пишет THOUGHTS и CRITICS перед планом и действиями (ваше)
     vocab_cap: int = 6000           # компактный словарь модели мира (предл.)
     wm_dim: int = 384
     wm_layers: int = 4
@@ -272,7 +274,7 @@ class Config:
                     kk_people=(2, 8), kk_eval_people=(2, 8), dataset_tasks=1000, dataset_attempts=2, dataset_parts=8,
                     wm_attempts=1000, bc_max_steps=3000,
                     n_iter_tasks=32, n_eval=105, iterations=8, eval_every=4, window=512, max_state_tokens=512,
-                    max_action_tokens=160, gen_action_tokens=192, vocab_cap=8000,
+                    max_action_tokens=160, gen_action_tokens=320, vocab_cap=8000,
                     wm_backbone="answerdotai/ModernBERT-base", wm_grad_ckpt=True,
                     wm_copy_steps=1000, wm_boot_steps=1000, rep_warmup=300, wm_iter_steps=150, wm_batch=16,
                     imag_batch=32, imag_rounds=2, critic_steps=16, vm_max_tokens=1024, gen_batch=128,
@@ -292,7 +294,7 @@ class Config:
                     kk_people=(2, 8), kk_eval_people=(2, 8), dataset_tasks=0, dataset_attempts=2, dataset_parts=24,
                     wm_attempts=4000, bc_max_steps=6000,
                     n_iter_tasks=64, n_eval=350, iterations=10, eval_every=5, max_state_tokens=512,
-                    max_action_tokens=160, gen_action_tokens=192, window=512, vocab_cap=8000, wm_batch=16,
+                    max_action_tokens=160, gen_action_tokens=320, window=512, vocab_cap=8000, wm_batch=16,   # 320: мысли+критика
                     wm_backbone="answerdotai/ModernBERT-base", wm_grad_ckpt=True,
                     wm_copy_steps=2000, wm_boot_steps=2000, vm_max_tokens=1024, imag_batch=64, gen_batch=128,
                     gen_tokens=192000, lp_batch=8)
@@ -311,6 +313,9 @@ def fit_gpu(cfg, gb=None):
         return cfg
     small = dict(gen_batch=64, gen_tokens=64000, wm_batch=8, wm_grad_ckpt=True, vm_batch=16, vm_grad_ckpt=True,
                  lp_batch=4, actor_batch=16, imag_batch=min(cfg.imag_batch, 32), critic_batch=min(cfg.critic_batch, 64))
+    m = re.search(r"(\d+(?:\.\d+)?)B", cfg.actor_model)
+    if cfg.actor_quant or (m and float(m.group(1)) >= 6):   # 7B (в 4 битах): кэш генерации вдвое больше на токен
+        small.update(gen_batch=32, gen_tokens=32000, lp_batch=2, actor_batch=8)
     print(f"GPU {gb:.0f} GB: {small}")
     return replace(cfg, **small)
 
@@ -672,21 +677,32 @@ Q_SUB = "Q (answer only this question):"                          # и един�
 
 class ArithTask:
     name = "arith"
-    hint = ("The task Q is an arithmetic expression; the answer is a number. A larger bracket can be handed to a "
-            "helper as one request, e.g. 'SUB: (12 - 5) * (3 + 4)'.")
-    shots = [   # примеры для стартовой политики: реплики чата «состояние → ответ актора»
+    # условия задачи (подставляемая часть базы; ваше: база универсальна, условия — отдельно)
+    block_top = ("задача Q - арифметическое выражение; ответ - число. ответ пиши ровно в форме \"ANSWER: <число>\". "
+                 "крупную скобку можно отдать подзадаче целиком: \"SUB: (12 - 5) * (3 + 4)\"; мелкие вычисления - "
+                 "запросами: \"LLM: 3 + 4\".")
+    block_sub = block_top + " на подуровне Q - уже часть выражения: вычисли её."
+    block_exec = "запрос - арифметическое выражение; верни только число."
+    shots_top = [   # примеры для стартовой политики: реплики чата «состояние → ответ актора» (верхний уровень)
         ("Q: Compute (3 + 4) * (10 - 2)\nL: 0/{L} T: 0/{T}",
+         "THOUGHTS: two brackets and then a product; the brackets do not depend on each other.\n"
+         "CRITICS: ok: each bracket is small enough for one request.\n"
          "PLAN: compute both brackets, then multiply\nLLM: 3 + 4\nLLM: 10 - 2"),
         ("Q: Compute (3 + 4) * (10 - 2)\nL: 0/{L} T: 1/{T}\nP: compute both brackets, then multiply\n"
-         "S1: LLM 3 + 4 = 7 ; LLM 10 - 2 = 8", "PLAN: multiply the results\nLLM: 7 * 8"),
+         "S1: LLM 3 + 4 = 7 ; LLM 10 - 2 = 8",
+         "THOUGHTS: both brackets are known: 7 and 8; the product is left.\nCRITICS: ok: the results match the brackets.\n"
+         "PLAN: multiply the results\nLLM: 7 * 8"),
         ("Q: Compute (3 + 4) * (10 - 2)\nL: 0/{L} T: 2/{T}\nP: multiply the results\n"
-         "S1: LLM 3 + 4 = 7 ; LLM 10 - 2 = 8\nS2: LLM 7 * 8 = 56", "PLAN: done\nANSWER: 56"),
+         "S1: LLM 3 + 4 = 7 ; LLM 10 - 2 = 8\nS2: LLM 7 * 8 = 56",
+         "THOUGHTS: the product 7 * 8 = 56 is the value of the whole expression.\nCRITICS: ok: nothing is left to compute.\n"
+         "PLAN: done\nANSWER: 56"),
+    ]
+    shots_sub = [   # подуровень: Q — часть выражения
         (PATH_HEAD + "\n[L0] Q: Compute ((3 + 4) * (10 - 2)) - 5\n" + Q_SUB + " (3 + 4) * (10 - 2)\nL: 1/{L} T: 0/{T}",
+         "THOUGHTS: my part is the product of two brackets; the outer minus 5 belongs to the level above.\n"
+         "CRITICS: ok: I do not re-ask my own expression, I compute its brackets.\n"
          "PLAN: compute both brackets\nLLM: 3 + 4\nLLM: 10 - 2"),
     ]
-    hint_nosub = "The task Q is an arithmetic expression; the answer is a number."
-    system_exec = ("Answer only the QUESTION (an arithmetic expression); the CONTEXT is for reference. "
-                   "Reply with only the resulting number.")
     system_direct = "Compute the expression step by step. End with a line 'ANSWER: <number>'."
     exec_max_new = 16
     direct_max_new = 384
@@ -767,33 +783,49 @@ KK_NAMES = ["Zoey", "Ethan", "Mia", "Liam", "Ava", "Noah", "Emma", "Lucas", "Oli
 
 class KKTask:
     name = "kk"
-    hint = ("The task Q is a knights-and-knaves puzzle: knights always tell the truth, knaves always lie. A natural way "
-            "to delegate is case analysis, e.g. 'SUB: Assume Zoey is a knight. Who is a knight and who is a knave?' "
-            "(every SUB and LLM request automatically gets the path: the puzzle and the steps done above). The "
-            "answer names the role of every "
-            "inhabitant, e.g. 'ANSWER: Zoey is a knight, Ethan is a knave'. If the assumptions in Q together with "
-            "those on the PATH lead to a "
-            "contradiction, answer 'ANSWER: contradiction'.")
+    block_top = ("головоломка о рыцарях (knight) и лжецах (knave): рыцари всегда говорят правду, лжецы всегда лгут. "
+                 "запросы, подзадачи и ответ пиши по-английски. в ответе перечисли роль каждого жителя ровно в форме "
+                 "\"ANSWER: Zoey is a knight, Ethan is a knave\"; если допущения из Q и PATH ведут к противоречию - ровно "
+                 "\"ANSWER: contradiction\". дели разбором случаев: \"SUB: Assume Zoey is a knight. Who is a knight and who "
+                 "is a knave?\"; в подзадаче повтори допущения этого уровня и добавь одно новое.")
+    block_sub = block_top + (" на подуровне Q уже содержит допущение: подставь его в высказывания жителей и выведи "
+                             "остальные роли сам; дели дальше, только если без этого не обойтись.")
+    block_exec = "головоломка о рыцарях (knight) и лжецах (knave): рыцари всегда говорят правду, лжецы всегда лгут. отвечай по-английски."
     _q = ("A very special island is inhabited only by knights and knaves. Knights always tell the truth, and knaves always lie. You meet 3 inhabitants: Zoey, Ethan and Mia. Zoey says: \"Ethan is a knave or Mia is a knight.\" Ethan says: \"Mia is a knight or Zoey is a knight.\" Mia says: \"Zoey is a knight if and only if Ethan is a knight.\" Who is a knight and who is a knave?")
-    shots = [
+    _sub = PATH_HEAD + "\n[L0] Q: " + _q + "\n" + Q_SUB + " Assume Zoey is a %s. Who is a knight and who is a knave?\nL: 1/{L} T: 0/{T}"
+    shots_top = [
         ("Q: " + _q + "\nL: 0/{L} T: 0/{T}",
-         "PLAN: case analysis on Zoey\nSUB: Assume Zoey is a knight. Who is a knight and who is a knave?\n"
+         "THOUGHTS: three statements and no roles known yet; Zoey's role decides the others, so I split on Zoey.\n"
+         "CRITICS: ok: both cases are listed, each sub-task will report the roles or a contradiction.\n"
+         "PLAN: split on Zoey, then pick the consistent case and answer\n"
+         "SUB: Assume Zoey is a knight. Who is a knight and who is a knave?\n"
          "SUB: Assume Zoey is a knave. Who is a knight and who is a knave?"),
-        (PATH_HEAD + "\n[L0] Q: " + _q + "\n" + Q_SUB + " Assume Zoey is a knave. Who is a knight and who is a "
-         "knave?\nL: 1/{L} T: 0/{T}",
+        ("Q: " + _q + "\nL: 0/{L} T: 1/{T}\nP: split on Zoey, then pick the consistent case and answer\nS1: SUB Assume Zoey "
+         "is a knight. Who is a knight and who is a knave? = Zoey is a knight, Ethan is a knight, Mia is a knight ; SUB Assume "
+         "Zoey is a knave. Who is a knight and who is a knave? = contradiction",
+         "THOUGHTS: case Zoey knight gave a full assignment, case Zoey knave gave a contradiction, so only the first case stands.\n"
+         "CRITICS: ok: the answer names every inhabitant.\n"
+         "PLAN: pick the consistent case and answer: only the first case is consistent\n"
+         "ANSWER: Zoey is a knight, Ethan is a knight, Mia is a knight"),
+    ]
+    shots_sub = [   # подуровень видит только свои примеры (ваше+предл.: примеры верха на подуровне учили копировать свой вопрос)
+        (_sub % "knave",
+         "THOUGHTS: Zoey lies, so Ethan is a knight and Mia is a knave; then Ethan's statement must be true, but Mia knight or Zoey knight is false.\n"
+         "CRITICS: the contradiction follows directly, no sub-task is needed; the answer must be the word contradiction.\n"
          "PLAN: Zoey lies, so Ethan is a knight and Mia is a knave; then Ethan's statement is false, impossible\n"
          "ANSWER: contradiction"),
-        ("Q: " + _q + "\nL: 0/{L} T: 1/{T}\nP: case analysis on Zoey\nS1: SUB Assume Zoey is a knight. Who is a "
-         "knight and who is a knave? = Zoey is a knight, Ethan is a knight, Mia is a knight ; SUB Assume Zoey is a "
-         "knave. Who is a knight and who is a knave? = contradiction",
-         "PLAN: only the first case is consistent\nANSWER: Zoey is a knight, Ethan is a knight, Mia is a knight"),
+        (_sub % "knight",
+         "THOUGHTS: Zoey is already assumed a knight; Ethan's role is still open and decides Mia's.\n"
+         "CRITICS: I must not re-ask the question I was given, so each sub-task keeps Zoey knight and adds Ethan's role.\n"
+         "PLAN: split on Ethan\n"
+         "SUB: Assume Zoey is a knight and Ethan is a knight. Who is a knight and who is a knave?\n"
+         "SUB: Assume Zoey is a knight and Ethan is a knave. Who is a knight and who is a knave?"),
+        (_sub % "knight",
+         "THOUGHTS: Zoey tells the truth; if Ethan were a knave his statement would be true, impossible, so Ethan is a knight; then Mia's statement is true, so Mia is a knight.\n"
+         "CRITICS: checked all three statements against this assignment; nothing left to split.\n"
+         "PLAN: Zoey tells the truth; if Ethan were a knave his statement would be true, impossible, so Ethan is a knight; then Mia's statement is true, so Mia is a knight\n"
+         "ANSWER: Zoey is a knight, Ethan is a knight, Mia is a knight"),
     ]
-    hint_nosub = ("The task Q is a knights-and-knaves puzzle: knights always tell the truth, knaves always lie. "
-                  "Requests get the path automatically: the puzzle and the steps done above. The answer names the role "
-                  "of every inhabitant, e.g. 'ANSWER: Zoey is a knight, Ethan is a knave'. If the assumptions in Q "
-                  "together with those on the PATH lead to a contradiction, answer 'ANSWER: contradiction'.")
-    system_exec = ("Answer only the QUESTION about knights (always tell the truth) and knaves (always lie); the "
-                   "CONTEXT holds the puzzle and the work done so far. Give only the short final answer.")
     system_direct = ("Solve the puzzle step by step. End with a line 'ANSWER: Name is a knight, Name is a knave, ...' "
                      "naming every inhabitant.")
     exec_max_new = 48
@@ -924,6 +956,30 @@ class KKTask:
         found = self.roles(answer)
         return bool(truth) and all(found.get(n) == v for n, v in truth.items())
 
+    ASSUME_RE = re.compile(r"\b([A-Z][a-z]+) is (?:a |an )?(knight|knave)\b")
+    PLURAL_RE = re.compile(r"((?:\b[A-Z][a-z]+\b(?:\s*,\s*|\s+and\s+))+\b[A-Z][a-z]+\b) are (?:both |all )?(knights|knaves)\b")
+
+    @classmethod
+    def assumptions(cls, q):
+        """Допущения (имя, роль) вопроса-допущения: первая фраза («Assume X is a knight and Y, Z are knaves»)."""
+        head = re.split(r"\.|\bWho is\b|\?", q or "", 1)[0]
+        if not re.match(r"\s*(Assume|Suppose|If)\b", head, re.I):
+            return set()
+        out = {(n, r) for n, r in cls.ASSUME_RE.findall(head)}
+        for names, role in cls.PLURAL_RE.findall(head):
+            out |= {(n, role[:-1]) for n in re.findall(r"[A-Z][a-z]+", names) if n not in ("Assume", "Suppose", "If")}
+        return out
+
+    def repeats(self, text, own, path_qs):
+        """Подзадача без нового допущения (копия) или с перевёрнутым (переворот) — бесполезна (ваше наблюдение по v8)."""
+        pairs = self.assumptions(text)
+        if not pairs:
+            return False
+        known = self.assumptions(own) | {a for q in path_qs for a in self.assumptions(q)}
+        if any((n, "knave" if r == "knight" else "knight") in known for n, r in pairs):
+            return True
+        return not (pairs - known)
+
     def norm_result(self, text):
         text = (text or "").strip()
         return text.splitlines()[0][:200] if text else "?"
@@ -976,22 +1032,26 @@ class KKTask:
 
 class GSM8KTask(ArithTask):
     name = "gsm8k"
-    hint = ("The task Q is a grade-school math word problem; the answer is a number. Delegate sub-questions or "
-            "calculations (every SUB and LLM request automatically gets the path: the problem and the steps above).")
+    block_top = ("задача Q - школьная текстовая задача; ответ - число. ответ пиши ровно в форме \"ANSWER: <число>\". дели на "
+                 "подвопросы и вычисления: \"SUB: How many apples are in the 3 boxes?\", \"LLM: 3 * 12\".")
+    block_sub = block_top + " на подуровне Q - подвопрос задачи: ответь на него числом."
+    block_exec = "верни только итоговое число."
     _q = "Tom has 3 boxes with 12 apples in each box. He gives 10 apples to a friend. How many apples does Tom have left?"
-    shots = [
-        ("Q: " + _q + "\nL: 0/{L} T: 0/{T}", "PLAN: count all apples, then subtract the gift\nLLM: 3 * 12"),
+    shots_top = [
+        ("Q: " + _q + "\nL: 0/{L} T: 0/{T}",
+         "THOUGHTS: first the total number of apples, then subtract the gift.\nCRITICS: ok: one multiplication, then one subtraction.\n"
+         "PLAN: count all apples, then subtract the gift\nLLM: 3 * 12"),
         ("Q: " + _q + "\nL: 0/{L} T: 1/{T}\nP: count all apples, then subtract the gift\nS1: LLM 3 * 12 = 36",
+         "THOUGHTS: 36 apples in total; 10 go to the friend.\nCRITICS: ok: the subtraction gives the answer.\n"
          "PLAN: subtract the 10 apples\nLLM: 36 - 10"),
         ("Q: " + _q + "\nL: 0/{L} T: 2/{T}\nP: subtract the 10 apples\nS1: LLM 3 * 12 = 36\nS2: LLM 36 - 10 = 26",
-         "PLAN: done\nANSWER: 26"),
+         "THOUGHTS: 36 - 10 = 26 apples are left.\nCRITICS: ok: this answers the question.\nPLAN: done\nANSWER: 26"),
+    ]
+    shots_sub = [
         (PATH_HEAD + "\n[L0] Q: " + _q + "\n" + Q_SUB + " How many apples are in the 3 boxes?\nL: 1/{L} T: 0/{T}",
+         "THOUGHTS: 3 boxes of 12 apples; the gift is not my question.\nCRITICS: ok: one multiplication answers it.\n"
          "PLAN: multiply\nLLM: 3 * 12"),
     ]
-    hint_nosub = ("The task Q is a grade-school math word problem; the answer is a number. Delegate calculations "
-                  "(every request automatically gets the path: the problem and the steps above).")
-    system_exec = ("Answer only the QUESTION; the CONTEXT holds the problem and the work done so far. "
-                   "Reply with only the final number.")
     system_direct = "Solve the problem step by step. End with a line 'ANSWER: <number>'."
     exec_max_new = 24
     direct_max_new = 512
@@ -1177,7 +1237,7 @@ def vm_text(f, keep=None):
     return "\n".join(lines)
 
 
-ACT_RE = re.compile(r"^\s*(PLAN|LLM|SUB|ANSWER)\s*:\s*(.*?)\s*$", re.I)
+ACT_RE = re.compile(r"^\s*(THOUGHTS|CRITICS|PLAN|LLM|SUB|ANSWER)\s*:\s*(.*?)\s*$", re.I)
 STATE_LINE_RE = re.compile(r"^\s*S\d+\s*:\s*(.*?)\s*$", re.I)        # модель пишет в стиле состояния: «S2: SUB q ; LLM q2»
 STATE_REQ_RE = re.compile(r"^(SUB|LLM|ANSWER)\b\s*:?\s*(.*?)\s*$", re.I)
 
@@ -1198,6 +1258,8 @@ def parse_action(text, level, cfg):
             if not items:
                 continue
         for key, val in items:
+            if key in ("THOUGHTS", "CRITICS"):          # мысли и критика — не игроки и не действия
+                continue
             if key == "PLAN":
                 plan, plan_line = val, line.strip()
             elif key == "ANSWER":
@@ -1219,21 +1281,90 @@ def parse_action(text, level, cfg):
     return plan, reqs, answer, players
 
 
-ACTOR_INTRO = ("You solve the task Q of the state (at sub-levels: the line 'Q (answer only this question)') by "
-               "delegating. Each turn write 'PLAN: <short plan>' and then either up to {k} request lines ")
-ACTOR_REQS_SUB = ("'LLM: <request>' (an assistant answers it in one go) or 'SUB: <sub-task>' (a helper solves it in "
-                  "several turns, the same way you do; SUB in the state shows how many sub-tasks you may still create)")
-ACTOR_REQS_LLM = "'LLM: <request>' (an assistant answers it in one go)"
-ACTOR_REST = (", or a line 'ANSWER: <final answer>'. Requests of one turn run in parallel and do not see each other's "
-              "results. Every request automatically gets the path: the task and the steps done so far on every level; "
-              "anything else it needs must be written into the request. The requests of turn n appear in the state as S<n> "
-              "and their results, in the same order, as R<n>. "
-              "T is your budget of turns: used/total. When the turns run out without an ANSWER line the task fails "
-              "exactly as with a wrong answer, so plan the requests to leave a turn for the ANSWER. If the state starts "
-              "with PATH, those lines "
-              "are read-only context from the levels above: answer only the question marked "
-              "'Q (answer only this question)'.")
-SYSTEM_ACTOR = ACTOR_INTRO + ACTOR_REQS_SUB + ACTOR_REST
+def parse_thoughts(text):
+    """Строки THOUGHTS и CRITICS действия, как написаны (или None)."""
+    th = cr = None
+    for line in (text or "").splitlines():
+        m = ACT_RE.match(line)
+        if m and m.group(1).upper() == "THOUGHTS" and th is None:
+            th = line.strip()
+        elif m and m.group(1).upper() == "CRITICS" and cr is None:
+            cr = line.strip()
+    return th, cr
+
+
+def action_core(text, level, cfg):
+    """Действие для модели мира и среды: только строки-игроки (PLAN, запросы, ANSWER) — мысли и критика в состояние не
+    попадают и среду не меняют (предл.)."""
+    return "\n".join(parse_action(text, level, cfg)[3])
+
+
+def norm_words(text):
+    return set(re.sub(r"\W+", " ", (text or "").lower()).split())
+
+
+def path_questions(path):
+    """Вопросы уровней выше нуля из пути (условие задачи наверху — не вопрос-допущение)."""
+    return [l.split("Q: ", 1)[1] for l in path if re.match(r"\[L[1-9]\d*\] Q: ", l)]
+
+
+def repeats_question(text, own, path_qs):
+    """Страховка от копий (ваше+предл.): подзадача повторяет свой вопрос или вопрос пути — те же слова (Жаккар ≥ 0.9;
+    у настоящих сужений в датасете v8 он ≤ 0.89). Уточнение задачи — TASK.repeats (K&K: допущения не добавляют нового
+    или переворачивают известное). Такой SUB исполняется обычным запросом и штрафуется (repeat_request)."""
+    A = norm_words(text)
+    for q in [own] + list(path_qs):
+        B = norm_words(q)
+        if A and B and len(A & B) / len(A | B) >= 0.9:
+            return True
+    hook = getattr(TASK, "repeats", None)
+    return bool(hook and hook(text, own, path_qs))
+
+
+# Промпты (ваше, 2026-10-08): база универсальна и описывает, что делать; условия задачи — отдельный подставляемый блок
+# (TASK.block_top / block_sub / block_exec); текст по-русски, ключевые слова формата (PLAN, SUB, LLM, ANSWER, THOUGHTS,
+# CRITICS, Q, PATH, S/R, T) — протокол, их разбирает парсер. Мысли и критика (ваше) — свой аналог цепочки рассуждений:
+# они не попадают в состояние и в модель мира, но обусловливают действие и получают его суммарную заслугу (предл.).
+ACTOR_INTRO = ("ты исполняешь этап решения задачи. тебе будет дан план и предыдущие этапы. решение задачи может разбиваться "
+               "на подзадачи и уходить в глубину, при этом тебе будет дано описание всех этапов на всех уровнях в формате:")
+PLAN_DOC = ("план решения задачи разделенный на эпизоды. план можно менять по своему усмотрению. план может быть пустым - "
+            "это значит что тебе нужно придумать его. план не обязательно должен быть целым - можно писать пункт "
+            "\"придумать дальнейшую часть плана\". в одном эпизоде плана могут быть несколько целей \"сделать A и B\"")
+STATE_FORMAT = ("PATH: контекст уровней выше, только для чтения: строки [L<n>] Q: задача уровня n и [L<n>] S<k>: / [L<n>] R<k>: "
+                "его запросы и результаты. на верхнем уровне PATH нет\n"
+                "Q: твоя задача; на подуровне она помечена \"Q (answer only this question)\"\n"
+                "L: уровень/макс T: этапы использовано/всего SUB: сколько подзадач еще можно вызвать - одной строкой. оставь "
+                "последний этап на ответ\n"
+                "P: " + PLAN_DOC + "\n"
+                "S<n>: запросы и подзадачи этапа n с пометкой LLM/SUB через \" ; \" (\"S<n>: -\" - этап без запросов); "
+                "R<n>: результаты действий в эпизоде, в том же порядке (\"NO ANSWER\" - подзадача не дала ответа)")
+THOUGHTS_DOC = ("твои мысли: что известно из task, plan и episodes, что из этого следует и чего не хватает для ответа. "
+                "пиши своими словами, коротко")
+CRITICS_DOC = ("критика своих мыслей: где может быть ошибка, что противоречит условию или эпизодам, не повторяет ли "
+               "следующее действие уже сделанное или саму задачу. если всё в порядке - напиши \"ok\"")
+PLAN_RET = "новый план одной строкой; если старый план актуален, просто перепиши его"
+ACTOR_ANSWER = "в качестве действий ты можешь:\n1. написать ответ на текущую задачу. верни строку:\nANSWER: <ответ>"
+ACTOR_LAST = "это последний этап: из действий верни только ANSWER: <ответ>."
+ACTOR_REQ = ("либо до {k} раз за этап (запросы и подзадачи вместе):\n2. отправить запрос решающей модели. тут ты можешь "
+             "поставить вопрос на будущее, ответить на вопросы что есть, или просто написать рассуждение по поводу задачи "
+             "которое приблизит тебя к решению. в R<n> придет одна короткая строка ответа. не ссылайся в запросе на "
+             "результаты других запросов этого же этапа. верни строку:\nLLM: <запрос>")
+ACTOR_SUB = ("3. вызвать подзадачу. в этом случае решение перейдет на уровень подзадачи. модель решающая подзадачу будет "
+             "иметь описание всех эпизодов этого уровня, поэтому достаточно просто сформулировать подзадачу без "
+             "переписывания контекста. не повторяй задачу этого уровня. это действие расходует лимит вызова поддействий; "
+             "сколько осталось - в строке SUB. верни строку:\nSUB: <подзадача>")
+ACTOR_RULES = "других строк не пиши; в запросах не используй \" ; \" и \" = \"."
+EXEC_BASE = (ACTOR_INTRO + "\n[L<n>] Q: задача уровня n; [L<n>] S<k>: / [L<n>] R<k>: его запросы и результаты\n"
+             "QUESTION (answer only this): запрос для тебя. это может быть вопрос, todo, инструкции и т.п.\n\n"
+             "верни только ответ на QUESTION одной короткой строкой, не повторяя вопрос.")
+
+
+def output_block(cfg):
+    """Что вернуть: с мыслями — THOUGHTS, CRITICS, PLAN и строки действий; без — PLAN и строки действий."""
+    if cfg.thoughts:
+        return ("ответ верни строками, в этом порядке:\nTHOUGHTS: <" + THOUGHTS_DOC + ">\nCRITICS: <" + CRITICS_DOC + ">\n"
+                "PLAN: <" + PLAN_RET + ">\nи затем строки действий.")
+    return "ответ верни строками: PLAN: <" + PLAN_RET + "> и затем строки действий."
 
 
 def sub_allow(cfg, level):
@@ -1241,26 +1372,39 @@ def sub_allow(cfg, level):
     return max(cfg.sub_min, cfg.sub_top >> level) if level < cfg.max_level else 0
 
 
-ACTOR_LAST_TURN = ("This is your last turn: no request can be executed any more. Write 'PLAN: <one line>' and then "
-                   "'ANSWER: <final answer>' using the results gathered so far (at sub-levels, the answer to the "
-                   "question marked 'Q (answer only this question)'). ")
-
-
-def actor_system(cfg, allow_sub=True, last_turn=False):
-    """Подсказка актора. Счётчик подзадач кончился — SUB в ней даже не предлагается (ваше). Последний ход бюджета —
-    запросы не предлагаются вовсе, только ответ (ваше: как и с SUB, модель следует тому, что ей предложено)."""
+def actor_system(cfg, allow_sub=True, last_turn=False, level=0):
+    """Подсказка актора: база (ваш текст) + условия задачи своего уровня. Счётчик подзадач кончился — пункт SUB не
+    предлагается; последний ход — вместо запросов только ответ (ваше: модель следует тому, что ей предложено)."""
+    parts = [ACTOR_INTRO, STATE_FORMAT, output_block(cfg), ACTOR_ANSWER]
     if last_turn:
-        return ACTOR_LAST_TURN + TASK.hint_nosub
-    reqs = ACTOR_REQS_SUB if allow_sub else ACTOR_REQS_LLM
-    return (ACTOR_INTRO.format(k=cfg.max_reqs) + reqs + ACTOR_REST + " " +
-            (TASK.hint if allow_sub else TASK.hint_nosub))
+        parts.append(ACTOR_LAST)
+    else:
+        parts.append(ACTOR_REQ.format(k=cfg.max_reqs))
+        if allow_sub:
+            parts.append(ACTOR_SUB)
+        parts.append(ACTOR_RULES)
+    parts.append("условия задачи: " + (TASK.block_sub if level > 0 else TASK.block_top))
+    parts.append("вот текущий ввод:")
+    return "\n\n".join(parts)
 
 
-def task_shots(cfg, allow_sub=True, last_turn=False):
-    """Примеры с настоящими L, T и остатком SUB; без SUB — только примеры, где SUB нет; на последнем ходе — только
-    примеры с ответом, и ход в них — последний."""
+def exec_system():
+    """Подсказка исполнителя запросов LLM: та же база + условия задачи для исполнителя."""
+    return EXEC_BASE + "\n\nусловия задачи: " + TASK.block_exec
+
+
+def strip_thoughts(a):
+    """Действие примера без строк THOUGHTS/CRITICS (когда cfg.thoughts выключен)."""
+    return "\n".join(l for l in a.split("\n") if not re.match(r"^(THOUGHTS|CRITICS):", l))
+
+
+def task_shots(cfg, allow_sub=True, last_turn=False, level=0):
+    """Примеры своего уровня (ваше+предл.: верх видит примеры верха, подуровень — только свои) с настоящими L, T и
+    остатком SUB; без SUB — только примеры без SUB; на последнем ходе — только примеры с ответом, и ход в них — последний."""
     out = []
-    for u, a in TASK.shots:
+    for u, a in (TASK.shots_sub if level > 0 else TASK.shots_top):
+        if not cfg.thoughts:
+            a = strip_thoughts(a)
         if (not allow_sub or last_turn) and "SUB:" in a:
             continue
         if last_turn and ("LLM:" in a or "ANSWER:" not in a):
@@ -1276,10 +1420,10 @@ def task_shots(cfg, allow_sub=True, last_turn=False):
     return out
 
 
-def actor_prompt(actor, cfg, content, few_shot=False, allow_sub=True, last_turn=False):
+def actor_prompt(actor, cfg, content, few_shot=False, allow_sub=True, last_turn=False, level=0):
     """Подсказка актора: система + (примеры репликами чата — только для стартовой политики) + состояние или окно."""
-    return actor.prompt_ids(actor_system(cfg, allow_sub, last_turn), "STATE:\n" + content,
-                            task_shots(cfg, allow_sub, last_turn) if few_shot else None)
+    return actor.prompt_ids(actor_system(cfg, allow_sub, last_turn, level), "STATE:\n" + content,
+                            task_shots(cfg, allow_sub, last_turn, level) if few_shot else None)
 
 
 # модель не должна дописывать следующее состояние: в стартовых данных pro_v2 так продолжались ~4,5 % действий
@@ -1434,10 +1578,11 @@ def wm_tok(cfg):
 def vocab_seed_texts(cfg):
     """Тексты для словаря: служебные строки и много арифметики, чтобы покрыть все числа и операции."""
     rng = random.Random(123)
-    texts = [SYSTEM_ACTOR, TASK.hint, "PLAN: LLM: SUB: ANSWER: NO ANSWER Q: L: T: P: = ? ; -", PATH_HEAD, Q_SUB,
+    texts = [actor_system(cfg, True, False, 0), actor_system(cfg, True, False, 1), exec_system(),
+             "PLAN: LLM: SUB: ANSWER: THOUGHTS: CRITICS: NO ANSWER Q: L: T: P: = ? ; -", PATH_HEAD, Q_SUB,
              "REQUEST (evaluate the trajectory for this request only): PATH (context): CONTEXT (read-only): "
              "QUESTION (answer only this): " + " ".join(f"[L{i}]" for i in range(17))]
-    texts += [u + "\n" + a for u, a in task_shots(cfg)]
+    texts += [u + "\n" + a for u, a in task_shots(cfg) + task_shots(cfg, level=1)]
     texts += TASK.seed_texts(cfg)
     for i in range(1, cfg.max_steps + 3):
         texts.append(f"S{i}: L: {i}/{cfg.max_level} T: {i}/{cfg.max_steps}")
@@ -1827,10 +1972,20 @@ class HFActor:
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
         self.text_tok = HFTok(self.tok)
-        model = from_pretrained(AutoModelForCausalLM, cfg.actor_model).to(DEVICE)
+        if cfg.actor_quant == "4bit":                  # QLoRA: веса NF4, вычисления в bf16, адаптер поверх
+            from transformers import BitsAndBytesConfig
+            from peft import prepare_model_for_kbit_training
+            qc = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+                                    bnb_4bit_compute_dtype=DTYPE)
+            model = AutoModelForCausalLM.from_pretrained(cfg.actor_model, quantization_config=qc, device_map={"": 0})
+            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+        elif cfg.actor_quant:
+            raise ValueError(f"actor_quant={cfg.actor_quant!r}: поддерживается только \"4bit\"")
+        else:
+            model = from_pretrained(AutoModelForCausalLM, cfg.actor_model).to(DEVICE)
+            model.gradient_checkpointing_enable()
+            model.enable_input_require_grads()
         model.config.use_cache = False
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
         if adapter:
             model = PeftModel.from_pretrained(model, adapter, is_trainable=True)
         else:
@@ -1947,7 +2102,7 @@ class HFActor:
 
     def execute(self, requests):
         """Исполнитель запросов «LLM»: базовая модель без адаптера, жадно."""
-        prompts = [self.prompt_ids(TASK.system_exec, r) for r in requests]
+        prompts = [self.prompt_ids(exec_system(), r) for r in requests]
         outs = self.generate(prompts, TASK.exec_max_new, greedy=True, which="base")
         return [TASK.norm_result(t) for _, t in outs]
 
@@ -2231,7 +2386,7 @@ def run_episodes(tasks, actor, cfg, mode, wm=None, codec=None, greedy=False, few
             contents = [codec.window_text(w.tolist()) for w in wins]
         else:
             contents = states
-        prompts = [actor_prompt(actor, cfg, c, few_shot, a, lt) for c, a, lt in zip(contents, allow, lasts)]
+        prompts = [actor_prompt(actor, cfg, c, few_shot, a, lt, f["level"]) for f, c, a, lt in zip(ready, contents, allow, lasts)]
         acts = actor.generate(prompts, cfg.gen_action_tokens, greedy, cfg.temperature, which=which)
         jobs = []
         for f, s_text, c, p, (gids, text), al, lt in zip(ready, states, contents, prompts, acts, allow, lasts):
@@ -2253,6 +2408,8 @@ def run_episodes(tasks, actor, cfg, mode, wm=None, codec=None, greedy=False, few
                 f["pending"] = len(reqs)
                 for j, r in enumerate(reqs):
                     root = root_of[f["id"]]
+                    if r["dest"] == "SUB" and repeats_question(r["text"], f["request"], path_questions(f["path"])):
+                        r["dest"], r["repeat"] = "LLM", True   # копия своего вопроса — обычным запросом (страховка)
                     if r["dest"] == "SUB" and (f["subs_left"] <= 0 or size[root] >= cfg.sub_total):
                         r["dest"] = "LLM"                  # счётчик кончился: подзадача — обычным запросом
 
@@ -2296,10 +2453,14 @@ def episode_stats(tops, frames):
     for f in tops:
         if f.get("ppl") is not None:
             by_ppl.setdefault(str(f["ppl"]), []).append(f["R"])
+    rep = sum(1 for f in frames for st in f["steps"] for r in st["reqs"] if r.get("repeat"))
+    acts = [st.get("action") or "" for f in frames for st in f["steps"]]
     return {"acc": float(np.mean([f["R"] for f in tops])) if tops else 0.0,
             **({"by_ppl": {k: round(float(np.mean(v)), 3) for k, v in sorted(by_ppl.items())}} if by_ppl else {}),
             "answered": float(np.mean([f["answer"] is not None for f in tops])) if tops else 0.0,
             "llm_calls": llm / max(1, len(tops)), "sub_calls": sub / max(1, len(tops)),
+            "sub_repeats": rep / max(1, len(tops)),     # подзадач-копий, перехваченных страховкой, на задачу
+            "thoughts_rate": float(np.mean([parse_thoughts(a)[0] is not None for a in acts])) if acts else 0.0,
             "steps_top": float(np.mean([len(f["steps"]) for f in tops])) if tops else 0.0}
 
 
@@ -3034,7 +3195,9 @@ def coalition_next(f, t, S, n_players, cfg):
 def transitions(frames, cfg=None, cf_per_step=0):
     """Настоящие переходы (s, a, s'). cf_per_step > 0 (предл.): ещё точные контрфакты из того же шага — пустое
     действие и до cf_per_step случайных неполных коалиций строк, т. е. ровно то, о чём RSSM спрашивают в игре шага."""
-    out = [(st["state"], st["action"], st["next_state"], st.get("phi")) for f in frames for st in f["steps"]]
+    cfg = cfg or CFG
+    out = [(st["state"], action_core(st["action"], f["level"], cfg), st["next_state"], st.get("phi"))
+           for f in frames for st in f["steps"]]
     if not cf_per_step:
         return out
     for f in frames:
@@ -3144,12 +3307,14 @@ def lambda_returns(rewards, conts, values, gamma, lam):
     return ret
 
 
-def bad_action(text, reqs, ans, last, allow_sub, cfg):
+def bad_action(text, reqs, ans, last, allow_sub, cfg, repeats=0):
     """Штраф за неправильное действие (ваше; идёт в заслугу актора вместе с φ). 1 — пустой ход (ни запроса, ни ответа)
     и ходы кончились без ответа; 0.5 — SUB без права на него, дописанный «= результат», строки вне формата, запросов
-    больше max_reqs. Итог не больше 2. → (штраф, причины)."""
+    больше max_reqs, подзадача-копия своего вопроса (repeats > 0). Итог не больше 2. → (штраф, причины)."""
     lines = [l for l in (text or "").splitlines() if l.strip()]
     why = []
+    if repeats:
+        why.append("repeat_request")
     if ans is None and not reqs:
         why.append("empty")
     if last and ans is None:
@@ -3158,7 +3323,7 @@ def bad_action(text, reqs, ans, last, allow_sub, cfg):
         why.append("sub_not_allowed")
     if any(re.match(r"^\s*(S\d+\s*:\s*)?(SUB|LLM)\b", l, re.I) and " = " in l for l in lines):
         why.append("result_written")
-    if any(not re.match(r"^\s*(S\d+\s*:\s*)?(PLAN|SUB|LLM|ANSWER|R\d+)\b", l, re.I) for l in lines):
+    if any(not re.match(r"^\s*(S\d+\s*:\s*)?(THOUGHTS|CRITICS|PLAN|SUB|LLM|ANSWER|R\d+)\b", l, re.I) for l in lines):
         why.append("junk_lines")
     if sum(bool(re.match(r"^\s*(S\d+\s*:\s*)?(SUB|LLM)\b", l, re.I)) for l in lines) > cfg.max_reqs:
         why.append("too_many_requests")
@@ -3277,9 +3442,10 @@ def imagine_round(actor, actor_opt, wm, critic, critic_tgt, critic_opt, codec, s
             break
         cur = ws[-1]
         prompts = [actor_prompt(actor, cfg, codec.window_text(cur[b].tolist()), allow_sub=subs[b] > 0,
-                                last_turn=used[b] + h + 1 >= cfg.max_steps) for b in idx]
+                                last_turn=used[b] + h + 1 >= cfg.max_steps, level=levels[b]) for b in idx]
         acts = actor.generate(prompts, cfg.gen_action_tokens, greedy=False, temperature=cfg.temperature)
-        a_ids, a_pad = pad_batch([codec.ids(t, cfg.max_action_tokens) for _, t in acts])
+        a_ids, a_pad = pad_batch([codec.ids(action_core(t, levels[b], cfg), cfg.max_action_tokens)
+                                  for (_, t), b in zip(acts, idx)])
         nxt = cur.clone()
         nxt[idx] = wm.predict(cur[idx], a_ids, a_pad, cfg.denoise_steps)
         with torch.no_grad():
@@ -3291,14 +3457,23 @@ def imagine_round(actor, actor_opt, wm, critic, critic_tgt, critic_opt, codec, s
             plan, reqs, ans, players = parse_action(acts[k][1], levels[b], cfg)
             if used[b] + h + 1 >= cfg.max_steps and ans is None:
                 reqs = []                                  # последний ход: запросы не исполняются
+            wtext = codec.window_text(cur[b].tolist())
+            own = own_question(wtext)
+            pqs = path_questions([l for l in wtext.split("\n") if l.startswith("[L")])
+            nrep = 0
+            for rq in reqs:                                # страховка от копий — как в настоящем исполнении
+                if rq["dest"] == "SUB" and repeats_question(rq["text"], own, pqs):
+                    rq["dest"], nrep = "LLM", nrep + 1
             if subs[b] <= 0:                               # счётчик кончился: SUB — обычным запросом
                 for rq in reqs:
                     rq["dest"] = "LLM"
             subs[b] = max(0, subs[b] - sum(rq["dest"] == "SUB" for rq in reqs))
             last = used[b] + h + 1 >= cfg.max_steps            # ходы уровня кончились: эпизод обрывается
-            bad, why = bad_action(acts[k][1], reqs, ans, last, subs[b] + sum(rq["dest"] == "SUB" for rq in reqs) > 0, cfg)
+            bad, why = bad_action(acts[k][1], reqs, ans, last, subs[b] + sum(rq["dest"] == "SUB" for rq in reqs) > 0, cfg,
+                                  repeats=nrep)
             step.append({"b": b, "prompt": prompts[k], "gen": acts[k][0], "players": players, "answer": ans,
-                         "ans_i": len(players) - 1 if ans is not None else None, "last": last, "bad": bad, "why": why})
+                         "ans_i": len(players) - 1 if ans is not None else None, "last": last, "bad": bad, "why": why,
+                         "thoughts": [l for l in parse_thoughts(acts[k][1]) if l]})
             c[b] = 0.0 if (ans is not None or last) else 1.0
             if c[b] == 0:
                 alive[b] = False
@@ -3378,7 +3553,9 @@ def imagine_round(actor, actor_opt, wm, critic, critic_tgt, critic_opt, codec, s
         else:
             mean = float(np.mean(phi)) if phi else 0.0
             base, extra = a - pen, [clip(cfg.scar_lambda * (x - mean) / scale) for x in phi]
-        items.append((s["prompt"], s["gen"], token_weights(actor, s["gen"], s["players"], base, extra)))
+        tl = s.get("thoughts", [])                    # мысли и критика получают суммарную заслугу действия (предл.)
+        items.append((s["prompt"], s["gen"], token_weights(actor, s["gen"], s["players"] + tl, base,
+                                                          extra + [sum(extra)] * len(tl))))
         advs.append(a)
         phi_abs += [abs(clip(x / scale)) for x in phi]
     st = actor_steps(actor, actor_opt, items, cfg)
@@ -3399,6 +3576,7 @@ def imagine_round(actor, actor_opt, wm, critic, critic_tgt, critic_opt, codec, s
 def bc_items(actor, frames, cfg, mode, wm=None, codec=None):
     """Пары (подсказка, действие) из своих удачных попыток: наверху R = 1, подзадачи — внутри решённых задач."""
     steps = [st for f in frames if f.get("root_R", 0.0) > 0.5 for st in f["steps"]]
+    lvls = [f["level"] for f in frames if f.get("root_R", 0.0) > 0.5 for _ in f["steps"]]
     if not steps:
         return []
     if mode == "window":
@@ -3409,8 +3587,8 @@ def bc_items(actor, frames, cfg, mode, wm=None, codec=None):
     def gen(st):                                       # действие с дописанным «= результат» — переразобрать начисто
         clean = clean_action(st["action"])
         return st["gen"] if clean == st["action"] else actor.encode_action(clean)
-    return [(actor_prompt(actor, cfg, c, allow_sub=st.get("allow_sub", True), last_turn=st.get("last_turn", False)), gen(st))
-            for c, st in zip(contents, steps)]
+    return [(actor_prompt(actor, cfg, c, allow_sub=st.get("allow_sub", True), last_turn=st.get("last_turn", False),
+                          level=lv), gen(st)) for c, st, lv in zip(contents, steps, lvls)]
 
 
 def bc_train(actor, items, cfg):
@@ -3655,8 +3833,8 @@ def dataset_settings(cfg, n_attempts, n_parts):
     return json.loads(json.dumps({"attempts_total": n_attempts, "parts": n_parts, "cfg": {   # кортеж → список
         k: getattr(cfg, k) for k in ("task", "kk_source", "kk_people", "kk_depth", "dataset_tasks", "dataset_attempts",
                                      "dataset_parts", "dataset_temperature", "max_level", "max_reqs",
-                                     "max_answer_chars", "gen_action_tokens", "actor_model", "sub_top", "sub_min",
-                                     "sub_total")}}))
+                                     "max_answer_chars", "gen_action_tokens", "actor_model", "actor_quant", "thoughts",
+                                     "sub_top", "sub_min", "sub_total")}, "prompts": 9}))   # 9: база пользователя, мысли
 
 
 def normalize_frames(frames, cfg):
@@ -4478,6 +4656,21 @@ def dry_check():
     assert bad_action("SUB: q?", [{"dest": "SUB"}], None, True, True, CFG)[1] == ["no_answer_at_last_turn"]
     assert bad_action("PLAN: p\nSUB: q? = fake\nblah", [{"dest": "SUB"}], None, False, False, CFG) == (1.5, ["sub_not_allowed", "result_written", "junk_lines"])
     assert bad_action("PLAN: p\nANSWER: x", [], "x", True, True, CFG) == (0.0, [])
+    # мысли и критика: не игроки, не мусор; core действия — без них; заслуга мыслям — сумма заслуг строк
+    act_t = "THOUGHTS: t\nCRITICS: c\nPLAN: p\nSUB: q?\nLLM: r"
+    assert parse_action(act_t, 0, CFG)[3] == ["PLAN: p", "SUB: q?", "LLM: r"] and parse_thoughts(act_t) == ("THOUGHTS: t", "CRITICS: c")
+    assert action_core(act_t, 0, CFG) == "PLAN: p\nSUB: q?\nLLM: r" and parse_thoughts("PLAN: p") == (None, None)
+    assert bad_action(act_t, [{"dest": "SUB"}, {"dest": "LLM"}], None, False, True, CFG) == (0.0, [])
+    assert bad_action("PLAN: p\nSUB: q?", [{"dest": "LLM"}], None, False, True, CFG, repeats=1) == (0.5, ["repeat_request"])
+    class _P:                                          # токены-куски: «PLAN: p» (2 куска), «THOUGHTS: t» (2 куска)
+        pieces = staticmethod(lambda gen: ["PLAN:", " p", "\n", "THOUGHTS:", " t"])
+    assert token_weights(_P, [0, 1, 2, 3, 4], ["PLAN: p", "THOUGHTS: t"], -1.0, [2.0, 2.0]) == [1.0, 1.0, -1.0, 1.0, 1.0]
+    # страховка от копий: универсально — те же слова; сужение не ловится
+    q0 = "Assume James is a knight. Who is a knight and who is a knave?"
+    assert repeats_question(q0, q0, []) and repeats_question("Assume James is a knave. Who is a knight and who is a knave?", q0, [])
+    assert not repeats_question("Assume James is a knight and Liam is a knave. Who is a knight and who is a knave?", q0, [])
+    assert not repeats_question("Is Liam a knight?", q0, []) and repeats_question("(3 + 4) * (10 - 2)", "(3 + 4) * (10 - 2)", [])
+    assert path_questions(["[L0] Q: puzzle", "[L1] Q: Assume A is a knight. Who?", "[L1] S1: SUB x"]) == ["Assume A is a knight. Who?"]
     assert strip_echo("Is X a knight?", "Is X a knight? = yes") == "yes" and strip_echo("Is X a knight?", "yes") == "yes"
     assert strip_echo("Is X a knight?", "is x a knight?") == "?"
     pa = parse_action("PLAN: next case\nS2: SUB Assume A is a knave. Who is who? ; LLM Is B a knight?\nR2: A is a knave", 0, CFG)
@@ -4516,6 +4709,12 @@ def dry_check():
     train_vm_pairs(vm, prs, [], replace(ck, vm_point_weight=0.0), epochs=3)
     acc1 = vm_pair_acc(vm, prs)
     assert acc1 > max(0.7, acc0), (acc0, acc1)
+    # K&K: уточнение страховки по допущениям — копия с лишними словами и переворот ловятся, сужение — нет
+    kk = set_task(ck)
+    assert kk.assumptions("Assume Ella is a knave and Sebastian and Jacob are knights. Who?") == {("Ella", "knave"), ("Sebastian", "knight"), ("Jacob", "knight")}
+    assert repeats_question("Assume James is a knight, please check all statements carefully. Who is a knight and who is a knave?", q0, [])
+    assert repeats_question("Assume Liam is a knave. Who is a knight and who is a knave?", q0, ["Assume Liam is a knight. Who is a knight and who is a knave?"])
+    assert not repeats_question("Assume James is a knight and Liam is a knave. Who is a knight and who is a knave?", q0, [])
     set_task(CFG)
     class Stop(Exception):
         pass
@@ -4621,13 +4820,13 @@ def cli_args():
     """Параметры запуска на сервере (в Colab их нет; переменные окружения не нужны):
     python3 sleepwalker.py [--tasks N] [--iterations K] [--stage all|dataset|pretrain|experiment] [--shard i/n]
                            [--arms full,grpo_text] [--gpu N] [--gpu-gb GB] [--state-dir DIR] [--status [-v]]
-                           [--stop [RUN]] [--dry]"""
+                           [--stop [RUN]] [--actor MODEL] [--quant 4bit] [--dry]"""
     import argparse
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--tasks", type=int), ap.add_argument("--iterations", type=int)
     ap.add_argument("--stage", default="all"), ap.add_argument("--shard")
     ap.add_argument("--arms"), ap.add_argument("--gpu"), ap.add_argument("--gpu-gb", type=float), ap.add_argument("--state-dir")
-    ap.add_argument("--tag")
+    ap.add_argument("--tag"), ap.add_argument("--actor"), ap.add_argument("--quant")
     ap.add_argument("--status", action="store_true"), ap.add_argument("--dry", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true"), ap.add_argument("--stop", nargs="?", const="", default=None)
     return ap.parse_known_args()[0]
@@ -4639,6 +4838,10 @@ def kk_config(tasks=0, iterations=10):
     tasks = tasks or 0
     cfg = Config.pro(dataset_tasks=tasks, iterations=iterations)
     cfg = replace(cfg, horizon=cfg.max_steps)       # воображение — до конца ходов
+    if getattr(ARGS, "actor", None):                # --actor Qwen/Qwen2.5-7B-Instruct [--quant 4bit]: другой актор
+        cfg = replace(cfg, actor_model=ARGS.actor)
+    if getattr(ARGS, "quant", None):
+        cfg = replace(cfg, actor_quant=ARGS.quant)
     if tasks:
         att = tasks * cfg.dataset_attempts
         cfg = replace(cfg, dataset_parts=max(1, math.ceil(att / 520)), wm_attempts=min(cfg.wm_attempts, att),
@@ -4651,7 +4854,7 @@ NB_TASKS = 1000   # для ноутбука: sleepwalker.ipynb — 1000 зада
 IN_NOTEBOOK = "ipykernel" in sys.modules or "google.colab" in sys.modules
 N_TASKS = ARGS.tasks if ARGS.tasks is not None else (NB_TASKS if IN_NOTEBOOK else 0)   # сервер без флага — все задачи
 FULL_CFG = kk_config(N_TASKS, ARGS.iterations or 10)   # (имя TASKS занято реестром задач)
-PRE_NAME = f"kk_{N_TASKS or 'all'}_pre_v8"          # v8: подсказка про бюджет, 8 ходов — датасет и предобучение заново
+PRE_NAME = f"kk_{N_TASKS or 'all'}_pre_v9"          # v9: база промптов пользователя, мысли и критика, страховка копий — датасет заново
 FULL_NAME = PRE_NAME.replace("_pre_", "_exp_") + (f"_{ARGS.tag}" if ARGS.tag else "")   # --tag: ещё один эксперимент
 #                                                                                       с того же предобучения
 # На своём сервере (см. run_server.sh): --tasks N — задач в датасете (без флага — все); --iterations K; --stage all |
@@ -4660,7 +4863,8 @@ FULL_NAME = PRE_NAME.replace("_pre_", "_exp_") + (f"_{ARGS.tag}" if ARGS.tag els
 # --gpu-gb — память карты вручную; --state-dir ПАПКА — где хранить прогоны (по умолчанию ./sleepwalker_runs);
 # --status [-v] — состояние прогонов (без --state-dir — всех запомненных папок); --stop [ПРОГОН] — остановить на
 # ближайшей границе (без имени — все идущие в папке); --tag ИМЯ — суффикс имени эксперимента (новый эксперимент с того
-# же предобучения); --dry — проверка на заглушках.
+# же предобучения); --actor МОДЕЛЬ и --quant 4bit — другой актор (например, Qwen/Qwen2.5-7B-Instruct в NF4 через
+# bitsandbytes; пачки генерации вдвое меньше); --dry — проверка на заглушках.
 if ARGS.status:
     if ARGS.state_dir:
         remember_state_dir(BASE_DIR)
