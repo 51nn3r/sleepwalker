@@ -3944,6 +3944,13 @@ def normalize_frames(frames, cfg):
     for f in frames:                                   # пути: родители идут раньше детей
         if f["parent"] is not None:
             f["path"] = context_block(byid[f["parent"][0]], f["parent"][1])
+    for f in frames:                                   # истина подзадачи по эталону корня (датасет, собранный до sub_truth)
+        if f["level"] > 0 and f.get("truth") is None:
+            root = f
+            while root["parent"] is not None:
+                root = byid[root["parent"][0]]
+            f["truth"] = TASK.sub_truth(f["request"], root.get("truth"))
+            f["sub_ok"] = None if f["truth"] is None else bool(check_answer(f["answer"], f["truth"]))
     for f in frames:
         plan = None
         for t, st in enumerate(f["steps"]):
