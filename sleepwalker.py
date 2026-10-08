@@ -4823,11 +4823,11 @@ def dry_check():
     assert repeats_question("Assume James is a knave. Who is a knight and who is a knave?", q0, []), "переворот своего допущения (K&K)"
     assert not repeats_question("If James is a knight, is Liam a knight?", q0, []), "узкий вопрос при тех же допущениях — не копия"
     assert not repeats_question("Assume James is a knight. Assume Liam is a knave. Who is a knight and who is a knave?", q0, []), "двухфразное сужение"
-    tr = {"A": True, "B": False}                      # истина подзадачи-допущения по эталону корня
-    assert kk.sub_truth("Assume A is a knight. Who is a knight and who is a knave?", tr) == tr
-    assert kk.sub_truth("Assume A is a knave. Who is a knight and who is a knave?", tr) == "contradiction"
-    assert kk.sub_truth("Is B a knight?", tr) is None and kk.sub_truth(q0, None) is None
-    assert kk.check("contradiction", "contradiction") and not kk.check("A is a knight, B is a knave", "contradiction")
+    tr = {"Zoey": True, "Ethan": False}               # истина подзадачи-допущения по эталону корня
+    assert kk.sub_truth("Assume Zoey is a knight. Who is a knight and who is a knave?", tr) == tr
+    assert kk.sub_truth("Assume Zoey is a knave. Who is a knight and who is a knave?", tr) == "contradiction"
+    assert kk.sub_truth("Is Ethan a knight?", tr) is None and kk.sub_truth(q0, None) is None
+    assert kk.check("contradiction", "contradiction") and not kk.check("Zoey is a knight, Ethan is a knave", "contradiction")
     assert frame_label({"level": 1, "sub_ok": True, "answer": "x", "root_R": 0.0}) == 1.0 and frame_label({"level": 1, "sub_ok": None, "answer": "x", "root_R": 1.0}) == 1.0
     set_task(CFG)
     class Stop(Exception):
