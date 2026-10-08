@@ -34,8 +34,10 @@ if [ ! -d venv ]; then
   python3 -m venv venv
   ./venv/bin/pip install -q -U pip
   ./venv/bin/pip install -q torch transformers peft accelerate datasets
-  ./venv/bin/pip install -q bitsandbytes || echo "bitsandbytes не поставился: --quant 4bit работать не будет"
 fi
+case " $* " in *" --quant "*)                      # 4 бита: bitsandbytes ставится при первом запуске с --quant
+  ./venv/bin/python3 -c "import bitsandbytes" 2>/dev/null || ./venv/bin/pip install -q bitsandbytes ;;
+esac
 case " $* " in
   *" --status "*|*" --stop "*|*" --dry "*) exec ./venv/bin/python3 sleepwalker.py "$@" ;;
 esac
