@@ -4211,7 +4211,16 @@ def run_full_(cfg, D, an, seed, boot_frames, bc_frames, pairs, vocab, eval_tasks
                 f"окно пустое). Обучение в воображении поверх такого π0 мало что покажет.")
         a = metrics["eval_pi0"].get("vm_auc_top")
         g = metrics["eval_pi0"].get("vm_gain_auc_top")
-        if a is None or g is None:
+        pa = metrics.get("vm0", {}).get("pairs_acc")
+        if cfg.rm_anchor:                              # под якорем важно деление внутри задачи: порядок попыток одной задачи
+            sp = metrics.get("vm0", {}).get("split_against_answer_fail")
+            if pa is not None and pa < 0.6:
+                log(f"!!! ВНИМАНИЕ [{an}]: VM на отложенных парах одной задачи почти не отличает лучшую попытку "
+                    f"(pairs_acc {pa:.2f}; 0.5 — наугад): под якорём заслуги разделятся почти поровну между шагами.")
+            log(f"[{an}] VM под якорем: порядок попыток одной задачи pairs_acc {pa}, AUC по полному тексту на отложенных "
+                f"{a}, доля неудач с ANSWER ниже запросов {sp} (0.5 — шум; прирост от шагов {g} здесь не показателен: "
+                f"v(пусто) якорем не используется)")
+        elif a is None or g is None:
             log(f"!!! ВНИМАНИЕ [{an}]: VM на отложенных задачах не проверить — среди них нет удач.")
         elif a < 0.55 or g < 0.55:
             log(f"!!! ВНИМАНИЕ [{an}]: VM на отложенных задачах почти не отличает удачи от неудач по шагам "
